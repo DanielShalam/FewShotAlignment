@@ -83,7 +83,7 @@ def main():
     if args.eval_only:
         acc = evaluate(model, test_loader, device, alpha=cfg['alpha'], t_end=1.)
         logger.info(f"Test Accuracy (Before tuning): {acc:.2f}%")
-        val_acc, best_params = model.tune_hyperparameters(train_val_loader, device=device)
+        val_acc, best_params = model.tune_hyperparameters(val_loader, device=device)
         acc_tuned = evaluate(model, test_loader, device, alpha=best_params[0], t_end=best_params[1])
         logger.info(f"Best Hyparparams: alpha={best_params[0]}, timestep={best_params[1]}")
         logger.info(f"Test Accuracy (After tuning): {acc_tuned:.2f}%")
@@ -104,41 +104,40 @@ def main():
             scheduler.step()
         
         if epoch % eval_freq == 0:
-            logger.info(f"--- Fast Evaluation at Epoch {epoch} ---")
+            print(f"--- Fast Evaluation at Epoch {epoch} ---")
             if cfg['dataset'] != "VinDrCXR":
                 acc = evaluate(model, test_loader, device, alpha=cfg['alpha'])
-                logger.info(f"Test Accuracy: {acc:.2f}%")
+                print(f"Test Accuracy: {acc:.2f}%")
                 if acc > best_acc:
                     best_acc = acc
                     # Save best model logic can go here if needed.
             else:
                 acc = evaluate_multilabel(model, test_loader, dataset.multi_map, device, alpha=cfg['alpha'])
-                logger.info(f"Test Result: {acc}")
+                print(f"Test Result: {acc}")
 
     # Save Config and OP automatically
     save_checkpoint(model, optimizer, scheduler, cfg, epoch, args.output_dir, is_best=True)
 
     if cfg['dataset'] != "VinDrCXR":
         acc = evaluate(model, test_loader, device, alpha=cfg['alpha'])
+        print(f"Test Accuracy (Before tuning): {acc:.2f}%")
 
-        logger.info(f"Hyparparams tuning...")
-        val_acc, best_params = model.tune_hyperparameters(train_val_loader, device=device)
-        logger.info(f"Best Hyparparams: alpha={best_params[0]}, timestep={best_params[1]}")
+        print(f"Hyparparams tuning...")
+        val_acc, best_params = model.tune_hyperparameters(val_loader, device=device)
+        print(f"Best Hyparparams: alpha={best_params[0]}, timestep={best_params[1]}")
 
         acc_tuned = evaluate(model, test_loader, device, alpha=best_params[0], t_end=best_params[1])
-        logger.info(f"Test Accuracy (Before tuning): {acc:.2f}%")
-        logger.info(f"Test Accuracy (After tuning): {acc_tuned:.2f}%")
+        print(f"Test Accuracy (After tuning): {acc_tuned:.2f}%")
     else:
         multi_map = dataset.multi_map
         acc = evaluate_multilabel(model, test_loader, multi_map, device, alpha=cfg['alpha'])
+        logger.info(f"Test Result (Before tuning): {acc}")
 
         logger.info(f"Hyparparams tuning...")
         val_acc, best_params = model.tune_hyperparameters(val_loader, multi_map=dataset.multi_map, device=device)
         logger.info(f"Best Hyparparams: alpha={best_params[0]}, timestep={best_params[1]}")
 
         acc_tuned = evaluate_multilabel(model, test_loader, multi_map, device, alpha=best_params[0], t_end=best_params[1])
-
-        logger.info(f"Test Result (Before tuning): {acc}")
         logger.info(f"Test Result (After tuning): {acc_tuned}")
 
     return

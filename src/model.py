@@ -1136,21 +1136,21 @@ class ContrastiveMLPAdapter(FlowAdapter):
 
         hidden_dim = cfg.get("mlp_hidden_dim", out_dim * 2)
 
-        ada_kwargs = dict(
-            in_channels=out_dim, out_channels=out_dim,
-            num_res_blocks=cfg["ada_depth"], time_embed_dim=cfg["ada_t_dim"],
-            model_channels=cfg["ada_dim"], bottleneck_channels=cfg["ada_dim"],
-            use_context=False,
-            use_final_layer_head=cfg.get("use_final_layer_head", False),
-        )
-        self.adapter = SimpleMLPNoConditioning(**ada_kwargs)
-        # self.adapter = nn.Sequential(
-        #     nn.Linear(img_in_dim, hidden_dim),
-        #     nn.LayerNorm(hidden_dim),
-        #     nn.ReLU(inplace=True),
-        #     nn.Linear(hidden_dim, out_dim)
+        # ada_kwargs = dict(
+        #     in_channels=out_dim, out_channels=out_dim,
+        #     num_res_blocks=cfg["ada_depth"], time_embed_dim=cfg["ada_t_dim"],
+        #     model_channels=cfg["ada_dim"], bottleneck_channels=cfg["ada_dim"],
+        #     use_context=False,
+        #     use_final_layer_head=cfg.get("use_final_layer_head", False),
         # )
-        
+        # self.adapter = SimpleMLPNoConditioning(**ada_kwargs)
+        self.adapter = nn.Sequential(
+            nn.Linear(img_in_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, out_dim)
+        )
+        print(self.adapter)
         if cfg.get("text_adapter", True):
             self.t_adapter = nn.Sequential(
                 nn.Linear(txt_in_dim, hidden_dim),

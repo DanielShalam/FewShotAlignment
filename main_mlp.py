@@ -66,7 +66,7 @@ def main():
         
     if args.eval_only:
         acc = evaluate_mlp(model, test_loader, device, alpha=cfg['alpha'])
-        val_acc, best_params = model.tune_hyperparameters(train_val_loader, device=device)
+        val_acc, best_params = model.tune_hyperparameters(val_loader, device=device)
         acc_tuned = evaluate_mlp(model, test_loader, device, alpha=best_params[0])
         logger.info(f"Best Hyparparams: alpha={best_params[0]}")
         logger.info(f"Test Accuracy (Before tuning): {acc:.2f}%")
@@ -86,27 +86,27 @@ def main():
             scheduler.step()
         
         if epoch % eval_freq == 0:
-            logger.info(f"--- Fast Evaluation at Epoch {epoch} ---")
+            print(f"--- Fast Evaluation at Epoch {epoch} ---")
             if cfg['dataset'] != "VinDrCXR":
                 acc = evaluate_mlp(model, test_loader, device, alpha=cfg['alpha'])
-                logger.info(f"Test Accuracy: {acc:.2f}%")
+                print(f"Test Accuracy: {acc:.2f}%")
                 if acc > best_acc:
                     best_acc = acc
             else:
-                logger.info("Multi-label evaluate skipped - not stubbed yet")
+                print("Multi-label evaluate skipped - not stubbed yet")
 
     save_checkpoint(model, optimizer, scheduler, cfg, epoch, args.output_dir, is_best=True)
 
     if cfg['dataset'] != "VinDrCXR":
         acc = evaluate_mlp(model, test_loader, device, alpha=cfg['alpha'])
+        print(f"Test Accuracy (Before tuning): {acc:.2f}%")
 
-        logger.info("Hyparparams tuning...")
+        print("Hyparparams tuning...")
         val_acc, best_params = model.tune_hyperparameters(val_loader, device=device)
-        logger.info(f"Best Hyparparams: alpha={best_params[0]}")
+        print(f"Best Hyparparams: alpha={best_params[0]}")
 
         acc_tuned = evaluate_mlp(model, test_loader, device, alpha=best_params[0])
-        logger.info(f"Test Accuracy (Before tuning): {acc:.2f}%")
-        logger.info(f"Test Accuracy (After tuning): {acc_tuned:.2f}%")
+        print(f"Test Accuracy (After tuning): {acc_tuned:.2f}%")
     else:
         logger.info("Multi-label evaluation not fully stubbed for MLP baseline yet.")
         pass
