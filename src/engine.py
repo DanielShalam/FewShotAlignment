@@ -1,15 +1,30 @@
 import torch
+import numpy as np
 from tqdm import tqdm
+from sklearn.metrics import average_precision_score, roc_auc_score
 
 
-def train_one_epoch(model, loader, optimizer, epoch, device):
+def train_one_epoch(model, loader, optimizer, epoch, device, multi_map=None):
     model.train()
+    num_batches = len(loader)
+    if num_batches == 0:
+        raise ValueError(
+            "Train loader has zero batches. This usually means dataset size is smaller than batch_size with drop_last=True. "
+            "Reduce batch_size or disable drop_last for training."
+        )
+
     total_loss = 0
 
     pbar = tqdm(loader, desc=f"Epoch {epoch}", leave=False)
     for batch in pbar:
         images = batch['img'].to(device)
-        labels = batch['label'].to(device)
+
+        if multi_map is not None:
+            # Multi-label mode: build [B, C] target matrix from impaths.
+            impaths = batch["impath"]
+            labels = torch.stack([multi_map[p] for p in impaths], 0).to(device)
+        else:
+            labels = batch['label'].to(device)
 
         loss = model(images, labels=labels)
 
@@ -20,7 +35,7 @@ def train_one_epoch(model, loader, optimizer, epoch, device):
         total_loss += loss.item()
         pbar.set_postfix({'loss': loss.item()})
 
-    return total_loss / len(loader)
+    return total_loss / num_batches
 
 
 @torch.inference_mode()

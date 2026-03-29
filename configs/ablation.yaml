@@ -20,8 +20,10 @@ text_adapter: False
 ada_depth: 4
 ada_dim: 1536
 ada_t_dim: 256
+train_time_samples: 1
 alpha: 0. # blending ratio for eval
 use_context: False
+use_final_layer_head: False
 
 txt_src: "openai"
 txt_model: "ViT-B/16"

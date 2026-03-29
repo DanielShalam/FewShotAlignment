@@ -263,7 +263,7 @@ class VinDrCXR(DatasetBase):
       DICOM_CACHE_SUBDIR: str = "_png_cache"   # where to store converted PNGs
     """
 
-    dataset_dir = "VinDrCXR"
+    dataset_dir = "vindr_cxr/physionet.org/files/vindr-cxr/1.0.0"
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -283,7 +283,7 @@ class VinDrCXR(DatasetBase):
                 raise FileNotFoundError(f"[VinDrCXR] Missing path: {p}")
 
         # Options
-        opt = getattr(cfg.DATASET, "VINDR", None)
+        opt = getattr(cfg, "VINDR", None)
         use_clean6 = bool(getattr(opt, "USE_CLEAN6", True)) if opt else True
         drop_no_finding = bool(getattr(opt, "DROP_NO_FINDING", True)) if opt else True
         primary_strategy = (getattr(opt, "PRIMARY_STRATEGY", "rare") if opt else "rare")
@@ -378,7 +378,7 @@ class VinDrCXR(DatasetBase):
             per_class[primary].append(img_id)
 
         # Draw shots + validation per class
-        shots = int(getattr(cfg.DATASET, "NUM_SHOTS", 1))
+        shots = int(getattr(cfg, "shots", 1))
         tr_names, val_names = [], []
         for c in classnames:
             items = per_class.get(c, [])

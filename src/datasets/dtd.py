@@ -46,8 +46,6 @@ class DescribableTextures(DatasetBase):
                 with open(preprocessed, "wb") as file:
                     pickle.dump(data, file, protocol=pickle.HIGHEST_PROTOCOL)
 
-
-
         super().__init__(train_x=train, val=val, test=test)
 
     @staticmethod

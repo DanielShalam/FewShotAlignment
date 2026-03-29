@@ -19,7 +19,7 @@ import torchvision.transforms as T
 from torchvision.transforms import InterpolationMode
 from transformers import AutoImageProcessor
 from transformers import AutoConfig, AutoProcessor
-
+from sklearn.metrics import average_precision_score, roc_auc_score
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from PIL import Image, ImageOps
@@ -293,7 +293,7 @@ class ResBlock(nn.Module):
         input_dim = channels * 2 if use_skip else channels
 
         # We keep the norm layers out of the sequential so we can manually modulate them.
-        self.norm1 = nn.LayerNorm(channels)
+        self.norm1 = nn.LayerNorm(channels, elementwise_affine=False)
         self.act1 = nn.SiLU()
         self.linear1 = nn.Linear(input_dim, mid_channels, bias=True)
 
@@ -302,7 +302,7 @@ class ResBlock(nn.Module):
             nn.Linear(emb_channels, 2 * channels + 2 * mid_channels, bias=True) 
         )
 
-        self.norm2 = nn.LayerNorm(mid_channels)
+        self.norm2 = nn.LayerNorm(mid_channels, elementwise_affine=False)
         self.act2 = nn.SiLU()
         self.drop = nn.Dropout(p=dropout)
         self.out_proj = zero_module(nn.Linear(mid_channels, channels, bias=True))
@@ -372,6 +372,29 @@ class GaussianFourierProjection(nn.Module):
         return torch.cat([torch.cos(t_proj), torch.sin(t_proj)], dim=-1)
 
 
+def modulate(x, shift, scale):
+    return x * (1 + scale) + shift
+
+
+class FinalLayer(nn.Module):
+    """DiT-style conditioned final layer for vector outputs."""
+
+    def __init__(self, hidden_size, out_channels, embed_channels):
+        super().__init__()
+        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.linear = zero_module(nn.Linear(hidden_size, out_channels, bias=True))
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(embed_channels, 2 * hidden_size, bias=True)
+        )
+
+    def forward(self, x, c):
+        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
+        x = modulate(self.norm_final(x), shift, scale)
+        x = self.linear(x)
+        return x
+
+
 class SimpleMLP(nn.Module):
     """
     The full UNet model with attention and timestep embedding.
@@ -393,6 +416,7 @@ class SimpleMLP(nn.Module):
             dropout=0,
             use_context=False,
             context_channels=512,
+            use_final_layer_head=False,
     ):
         super().__init__()
 
@@ -402,6 +426,7 @@ class SimpleMLP(nn.Module):
         self.out_channels = out_channels
         self.num_res_blocks = num_res_blocks
         self.dropout = dropout
+        self.use_final_layer_head = use_final_layer_head
 
         # Use continuous random fourier features instead of fixed uniform stepping
         self.time_encoder = GaussianFourierProjection(self.model_channels)
@@ -426,11 +451,14 @@ class SimpleMLP(nn.Module):
             ))
         self.res_blocks = nn.ModuleList(res_blocks)
 
-        self.out = nn.Sequential(
-            nn.LayerNorm(model_channels, eps=1e-6),
-            nn.SiLU(),
-            zero_module(nn.Linear(model_channels, out_channels, bias=True)),
-        )
+        if self.use_final_layer_head:
+            self.out = FinalLayer(model_channels, out_channels, time_embed_dim)
+        else:
+            self.out = nn.Sequential(
+                nn.LayerNorm(model_channels, eps=1e-6),
+                nn.SiLU(),
+                zero_module(nn.Linear(model_channels, out_channels, bias=True)),
+            )
 
     def forward(self, t, x, y=None):
         """
@@ -453,7 +481,10 @@ class SimpleMLP(nn.Module):
         for block in self.res_blocks:
             x = block(x, emb, y)
 
-        x = self.out(x)
+        if self.use_final_layer_head:
+            x = self.out(x, emb)
+        else:
+            x = self.out(x)
 
         return x
 
@@ -538,6 +569,7 @@ class FlowAdapter(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = copy.deepcopy(cfg)
+        self.train_time_samples = int(cfg.get("train_time_samples", 1))
 
         self.bank_feat = None; self.bank_labels = None; self.bank_prototypes = None
 
@@ -562,6 +594,7 @@ class FlowAdapter(nn.Module):
             num_res_blocks=cfg["ada_depth"], time_embed_dim=cfg["ada_t_dim"],
             model_channels=cfg["ada_dim"], bottleneck_channels=cfg["ada_dim"],
             use_context=self.use_context, context_channels=velocity_dim,
+            use_final_layer_head=cfg.get("use_final_layer_head", False),
         )
 
         # I2T adapter
@@ -682,7 +715,14 @@ class FlowAdapter(nn.Module):
                   f"image aligned: {image_aligned.shape}, "
                   f"text aligned: {text_aligned.shape}")
 
-    def forward(self, images: Tensor, labels: Tensor = None, t_end: float = 0.5, solver: str = "dopri5"):
+    def forward(
+        self,
+        images: Tensor,
+        labels: Tensor = None,
+        t_end: float = 0.5,
+        solver: str = "dopri5",
+        steps: Optional[int] = None,
+    ):
         # 1. Encode
         img_feats = F.normalize(self.image_encoder(images), dim=-1)
         txt_feats = F.normalize(self.text_encoder().clone().detach(), dim=-1)
@@ -695,7 +735,11 @@ class FlowAdapter(nn.Module):
         if self.training and labels is not None:
             # conditional-flow-matching loss
             def cfm_loss(v_model, x_0, x_1, y=None):
-                t = torch.rand(x_0.shape[0], device=x_0.device)  # sample timestep
+                k = max(1, self.train_time_samples)
+                if k > 1:
+                    x_0 = x_0.repeat_interleave(k, dim=0)
+                    x_1 = x_1.repeat_interleave(k, dim=0)
+                t = torch.rand(x_0.shape[0], device=x_0.device)  # sample timestep(s)
                 p_s = self.path.sample(t=t, x_0=x_0, x_1=x_1)  # sample path
                 vt = v_model(p_s.t, p_s.x_t, y=y)
                 return torch.pow(vt - p_s.dx_t, 2).mean()
@@ -712,7 +756,7 @@ class FlowAdapter(nn.Module):
         # 4. Inference
         else:
             # 2-sided integration
-            i2t_feats = self._solve_ode(img_feats, t_end=t_end, method=solver, y=ctx)
+            i2t_feats = self._solve_ode(img_feats, t_end=t_end, method=solver, steps=steps, y=ctx)
 
             inv_fm_type = self.cfg["inv_fm_type"]
             if self.cfg["text_adapter"] and inv_fm_type != "none":
@@ -720,6 +764,7 @@ class FlowAdapter(nn.Module):
                     txt_feats, 
                     t_end=(1 - t_end), 
                     method=solver,
+                    steps=steps,
                     net_t=inv_fm_type not in ["reverse", "proto"],
                     reverse=inv_fm_type == "reverse",
                     use_protos=inv_fm_type == "proto",
@@ -737,7 +782,7 @@ class FlowAdapter(nn.Module):
 
     @torch.inference_mode()
     def _solve_ode(
-            self, x0: torch.Tensor, y: torch.Tensor = None, steps: int = 10, method: str = "dopri5",
+            self, x0: torch.Tensor, y: torch.Tensor = None, steps: Optional[int] = None, method: str = "dopri5",
             t_end: float = 1., net_t: bool = False, reverse: bool = False, use_protos: bool = False,
             return_intermediates=False) -> torch.Tensor:
         """Generate samples via an ODE solver from *torchdiffeq* (if available).
@@ -775,11 +820,15 @@ class FlowAdapter(nn.Module):
         else:
             # not an adaptive-step solver
             solver = RiemannianODESolver(velocity_model=WrappedModel(net), manifold=Sphere())  # create an ODESolver class
-            time_grid = torch.linspace(0., float(t_end), steps, device=x0.device)
+            n_steps = int(steps) if steps is not None else 1
+            n_steps = max(1, n_steps)
+            time_grid = torch.linspace(0.0, float(t_end), n_steps + 1, device=x0.device)
+            # For steps=1, using step_size=t_end violates strict interval>step_size checks in solver internals.
+            step_size = float(t_end) / float(max(n_steps, 2))
             sol = solver.sample(
                 x_init=x0,
-                step_size=0.001,
                 method=method,
+                step_size=step_size,
                 return_intermediates=return_intermediates,
                 time_grid=time_grid if not reverse else torch.flip(time_grid, dims=[0]),
                 y=y if self.use_context else None,
@@ -821,11 +870,21 @@ class MultiLabelFlowAdapter(FlowAdapter):
 
     def _text_mixture(self, y_multi: torch.Tensor, text_features: torch.Tensor, eps: float = 1e-6):
         # y_multi: [B,C] in {0,1}; text_features: [C,D]
+        if y_multi.ndim != 2:
+            raise ValueError(f"Expected multi-label targets with shape [B, C], got {tuple(y_multi.shape)}")
+        y_multi = y_multi.to(device=text_features.device, dtype=text_features.dtype)
         w = y_multi / (y_multi.sum(dim=1, keepdim=True) + eps)  # normalize per-sample if multiple positives
         x_txt_mix = w @ text_features  # [B, D]
         return F.normalize(x_txt_mix, dim=-1)
 
-    def forward(self, images: Tensor, labels: Tensor = None, t_end: float = 0.5, solver: str = "dopri5"):
+    def forward(
+        self,
+        images: Tensor,
+        labels: Tensor = None,
+        t_end: float = 0.5,
+        solver: str = "dopri5",
+        steps: Optional[int] = None,
+    ):
         # 1. Encode
         img_feats = F.normalize(self.image_encoder(images), dim=-1)
         txt_feats = F.normalize(self.text_encoder().clone().detach(), dim=-1)
@@ -837,12 +896,16 @@ class MultiLabelFlowAdapter(FlowAdapter):
         if self.training and labels is not None:
             # conditional-flow-matching loss
             def cfm_loss(v_model, x_0, x_1):
-                t = torch.rand(x_0.shape[0], device=x_0.device)  # sample timestep
+                k = max(1, self.train_time_samples)
+                if k > 1:
+                    x_0 = x_0.repeat_interleave(k, dim=0)
+                    x_1 = x_1.repeat_interleave(k, dim=0)
+                t = torch.rand(x_0.shape[0], device=x_0.device)  # sample timestep(s)
                 p_s = self.path.sample(t=t, x_0=x_0, x_1=x_1)  # sample path
                 vt = v_model(p_s.t, p_s.x_t)
                 return torch.pow(vt - p_s.dx_t, 2).mean()
 
-            txt_feats_mixture = self._text_mixture(labels, text_features)
+            txt_feats_mixture = self._text_mixture(labels, txt_feats)
 
             # image -> text loss
             loss = cfm_loss(v_model=self.adapter, x_0=img_feats, x_1=txt_feats_mixture)
@@ -856,12 +919,12 @@ class MultiLabelFlowAdapter(FlowAdapter):
         # 4. Testing Mode
         else:
             # 2-sided integration
-            i2t_feats = self._solve_ode(img_feats, t_end=t_end, method=solver)
+            i2t_feats = self._solve_ode(img_feats, t_end=t_end, method=solver, steps=steps)
 
             inv_fm_type = self.cfg["inv_fm_type"]
             if self.cfg["text_adapter"] and inv_fm_type != "none":
                 t2i_feats = self._solve_ode(
-                    txt_feats, t_end=(1 - t_end), method=solver,
+                    txt_feats, t_end=(1 - t_end), method=solver, steps=steps,
                     net_t=inv_fm_type not in ["reverse", "proto"],
                     reverse=inv_fm_type == "reverse", use_protos=inv_fm_type == "proto")
             else:
@@ -879,16 +942,16 @@ class MultiLabelFlowAdapter(FlowAdapter):
         if alphas is None: alphas = np.linspace(0.0, 1.0, 11)  # 0..1
         if t_end_list is None: t_end_list = np.linspace(0., 1., 11)
         best, best_pair = -1.0, (0.5, 0.6)
-        model.eval()
+        self.eval()
         for t_end in t_end_list:
             # accumulate all val scores/targets for this t_end
             all_scores = []
             all_targets = []
-            for batch in val_loader:
+            for batch in loader:
                 imgs = batch['img'].to(device)
                 impaths = batch["impath"]  # make sure your Dataset returns this
                 y_multi = torch.stack([multi_map[p] for p in impaths], 0).to(device)
-                logits = model(imgs, t_end=t_end, solver=solver)  # returns {"ZS_raw","MT_raw"}
+                logits = self.forward(imgs, t_end=t_end, solver=solver)  # returns {"ZS_raw","MT_raw"}
                 ZS = logits["ZS"].detach().cpu().numpy()
                 MT = logits["MT"].detach().cpu().numpy()
                 all_scores.append((ZS, MT))
@@ -915,6 +978,136 @@ class MultiLabelFlowAdapter(FlowAdapter):
                     best, best_pair = macro_ap, (float(a), float(t_end))
         return best, best_pair
 
+
+
+class ResBlockNoConditioning(nn.Module):
+    """
+    A residual block with AdaLN (Adaptive Layer Normalization) for timestep and context conditioning.
+    Supports dense skip connections for U-Net style architectures.
+    """
+
+    def __init__(
+            self,
+            channels,
+            mid_channels,
+            emb_channels,
+            dropout,
+            use_context=False,
+            context_channels=512,
+            use_skip=False
+    ):
+        super().__init__()
+        self.channels = channels
+        self.emb_channels = emb_channels
+        self.dropout = dropout
+        self.use_skip = use_skip
+
+        # Input dimension for first linear layer
+        input_dim = channels * 2 if use_skip else channels
+        model_channels = input_dim
+        # We keep the norm layers out of the sequential so we can manually modulate them.
+        self.norm1 = nn.LayerNorm(model_channels, eps=1e-6)
+        self.act1 = nn.SiLU()
+        self.linear1 = nn.Linear(input_dim, mid_channels, bias=True)
+
+        self.norm2 = nn.LayerNorm(model_channels, eps=1e-6)
+        self.act2 = nn.SiLU()
+        self.drop = nn.Dropout(p=dropout)
+        self.out_proj = nn.Linear(mid_channels, channels, bias=True)
+
+        self.use_context = use_context
+        if use_context:
+            self.context_layers = nn.MultiheadAttention(
+                embed_dim=mid_channels,
+                num_heads=8,
+                kdim=context_channels,
+                vdim=context_channels,
+                batch_first=True
+            )
+
+    def forward(self, x):
+        # 2. First block: Norm -> Modulate -> Act -> Linear
+        h = self.norm1(x)
+        h = self.act1(h)
+        h = self.linear1(h)
+
+        # 3. Second block: Norm -> Modulate -> Act -> Drop -> Linear
+        h = self.norm2(h)
+        h = self.act2(h)
+        h = self.drop(h)
+        h = self.out_proj(h)
+
+        # 4. Residual connection
+        return x + h
+
+
+class SimpleMLPNoConditioning(nn.Module):
+    """
+    The full UNet model with attention and timestep embedding.
+    Uses dense skip connections: input projection passed to all ResBlocks.
+    :param in_channels: channels in the input Tensor.
+    :param model_channels: base channel count for the model.
+    :param out_channels: channels in the output Tensor.
+    :param num_res_blocks: number of residual blocks per downsample.
+    """
+
+    def __init__(
+            self,
+            in_channels,
+            time_embed_dim,
+            model_channels,
+            bottleneck_channels,
+            out_channels,
+            num_res_blocks,
+            dropout=0,
+            use_context=False,
+            context_channels=512,
+            use_final_layer_head=False,
+    ):
+        super().__init__()
+
+        self.image_size = 1
+        self.in_channels = in_channels
+        self.model_channels = model_channels
+        self.out_channels = out_channels
+        self.num_res_blocks = num_res_blocks
+        self.dropout = dropout
+        self.use_final_layer_head = use_final_layer_head
+
+        self.input_proj = nn.Linear(in_channels, model_channels)
+
+        res_blocks = []
+        for i in range(num_res_blocks):
+            res_blocks.append(ResBlockNoConditioning(
+                model_channels,
+                bottleneck_channels,
+                time_embed_dim,
+                dropout,
+                use_context=use_context,
+                context_channels=context_channels,
+                use_skip=False,
+            ))
+        self.res_blocks = nn.ModuleList(res_blocks)
+
+        self.out = nn.Sequential(
+            nn.LayerNorm(model_channels, eps=1e-6),
+            nn.SiLU(),
+            nn.Linear(model_channels, out_channels, bias=True),
+        )
+
+    def forward(self, x):
+        """
+        Apply the model to an input batch.
+        :param x: an [N x C x ...] Tensor of inputs.
+        :param t: a 1-D batch of timesteps.
+        :param y: conditioning plugged in via crossattn
+        :return: an [N x C x ...] Tensor of outputs.
+        """
+        x = self.input_proj(x)
+        for block in self.res_blocks:
+            x = block(x)
+        x = self.out(x)
+        return x
 class ContrastiveMLPAdapter(FlowAdapter):
     def __init__(self, cfg):
         nn.Module.__init__(self)
@@ -943,12 +1136,20 @@ class ContrastiveMLPAdapter(FlowAdapter):
 
         hidden_dim = cfg.get("mlp_hidden_dim", out_dim * 2)
 
-        self.adapter = nn.Sequential(
-            nn.Linear(img_in_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, out_dim)
+        ada_kwargs = dict(
+            in_channels=out_dim, out_channels=out_dim,
+            num_res_blocks=cfg["ada_depth"], time_embed_dim=cfg["ada_t_dim"],
+            model_channels=cfg["ada_dim"], bottleneck_channels=cfg["ada_dim"],
+            use_context=False,
+            use_final_layer_head=cfg.get("use_final_layer_head", False),
         )
+        self.adapter = SimpleMLPNoConditioning(**ada_kwargs)
+        # self.adapter = nn.Sequential(
+        #     nn.Linear(img_in_dim, hidden_dim),
+        #     nn.LayerNorm(hidden_dim),
+        #     nn.ReLU(inplace=True),
+        #     nn.Linear(hidden_dim, out_dim)
+        # )
         
         if cfg.get("text_adapter", True):
             self.t_adapter = nn.Sequential(

@@ -22,12 +22,13 @@ def build_dataset(cfg):
 
 
 def build_loaders(cfg, dataset, train_tfm, eval_tfm, return_train_eval=False):
+    train_drop_last = len(dataset.train_x) >= int(cfg["batch_size"])
 
     # Build train_loader
     train_loader = torch.utils.data.DataLoader(
         DatasetWrapper(cfg, dataset.train_x, transform=train_tfm, is_train=True),
         batch_size=cfg["batch_size"], num_workers=cfg["num_workers"],
-        drop_last=True, pin_memory=True,
+        drop_last=train_drop_last, pin_memory=True,
     )
     # Build val_loader
     val_loader = None

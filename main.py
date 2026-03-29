@@ -43,7 +43,6 @@ def main():
     # Setup
     if args.output_dir is None:
         cfg_name = args.config.split('/')[-1].split('.yaml')[0]
-        # Append seed to output directory to prevent overlapping in parallel runs
         args.output_dir = os.path.join("./output", cfg["dataset"], cfg_name, f"seed_{cfg['seed']}", f"shots_{cfg['shots']}")
 
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
@@ -67,6 +66,10 @@ def main():
     logger.info(f"Building {cfg['dataset']} dataloaders...")
     train_loader, train_val_loader, val_loader, test_loader = build_loaders(
         cfg, dataset, model.train_tfm, model.eval_tfm, return_train_eval=True)
+    logger.info(
+        f"Loader sizes: train_batches={len(train_loader)}, train_eval_batches={len(train_val_loader)}, "
+        f"val_batches={len(val_loader) if val_loader is not None else 0}, test_batches={len(test_loader)}"
+    )
 
     # Linear alignment matrix (OP). Auto-load if resuming, or create it
     if args.resume:
@@ -94,8 +97,9 @@ def main():
     
     best_acc = 0.0
     eval_freq = cfg.get('eval_freq', cfg['epochs']) # Default to only evaluating at the end if not specified
+    train_multi_map = dataset.multi_map if cfg['dataset'] == "VinDrCXR" else None
     for epoch in range(1, cfg['epochs'] + 1):
-        loss = train_one_epoch(model, train_loader, optimizer, epoch, device)
+        loss = train_one_epoch(model, train_loader, optimizer, epoch, device, multi_map=train_multi_map)
         if scheduler is not None:
             scheduler.step()
         

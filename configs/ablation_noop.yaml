@@ -8,13 +8,13 @@ epochs: 200
 lr: 0.00001
 wd: 0.00001
 batch_size: 32
-eval_freq: 20
+eval_freq: 40
 num_workers: 8
 
 # Model / Flow
 fm_type: "geodesic"
 inv_fm_type: "adapter"
-use_op: True
+use_op: False
 pretrained_op: ""
 text_adapter: False
 ada_depth: 4
