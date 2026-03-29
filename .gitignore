@@ -8,9 +8,24 @@ run_depth_fsf_v3.py
 src/model_bpa.py
 src/model copy.py
 
-# Python cache/build artifacts
+# Python artifacts
 __pycache__/
 *.py[cod]
+*.so
+*.egg-info/
+build/
+dist/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
 
 # IDE metadata
 .idea/
+.vscode/
