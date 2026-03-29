@@ -1,0 +1,16 @@
+import src.datasets.oxford_pets
+import src.datasets.oxford_flowers
+import src.datasets.fgvc_aircraft
+import src.datasets.dtd
+import src.datasets.eurosat
+import src.datasets.stanford_cars
+import src.datasets.food101
+import src.datasets.sun397
+import src.datasets.caltech101
+import src.datasets.ucf101
+import src.datasets.imagenet
+import src.datasets.vindr_cxr
+import src.datasets.imagenet_sketch
+import src.datasets.imagenetv2
+import src.datasets.imagenet_a
+import src.datasets.imagenet_r

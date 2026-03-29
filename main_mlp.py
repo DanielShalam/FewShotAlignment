@@ -1,0 +1,123 @@
+import argparse
+import os
+from pathlib import Path
+import yaml
+import torch
+from src.utils import setup_logger, set_seed, save_checkpoint, load_checkpoint
+
+from src.datasets.base_dataset import build_dataset, build_loaders
+from src.model import ContrastiveMLPAdapter
+from src.engine import train_one_epoch, evaluate_mlp
+
+def get_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default="configs/default.yaml")
+    parser.add_argument("--output_dir", type=str, default=None)
+    parser.add_argument("--eval_only", action="store_true")
+    parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("opts", default=None, nargs=argparse.REMAINDER)
+    return parser.parse_args()
+
+def main():
+    args = get_args()
+
+    with open(args.config, 'r') as f:
+        cfg = yaml.safe_load(f)
+    cfg["text_adapter"] = False  # Force no text adapter for MLP baseline
+    cfg["lr"] = 0.0001
+
+    if args.opts:
+        if len(args.opts) % 2 != 0:
+            raise ValueError("Override options must be key-value pairs (e.g., 'epochs 100 lr 0.001')")
+        for i in range(0, len(args.opts), 2):
+            k = args.opts[i].lstrip("-")
+            v = args.opts[i+1]
+            try:
+                cfg[k] = yaml.safe_load(v)
+            except Exception as e:
+                print(e)
+                cfg[k] = v
+
+    if args.output_dir is None:
+        cfg_name = args.config.split('/')[-1].split('.yaml')[0]
+        args.output_dir = os.path.join("./output", cfg["dataset"], cfg_name + "_mlp", f"seed_{cfg['seed']}", f"shots_{cfg['shots']}")
+
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    logger = setup_logger(args.output_dir)
+    logger.info(f"Starting execution for seed {cfg['seed']} with config {args.config}")
+
+    set_seed(cfg['seed'])
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    dataset = build_dataset(cfg)
+    cfg["classnames"] = dataset.classnames
+
+    model = ContrastiveMLPAdapter(cfg).to(device)
+
+    logger.info(f"Building {cfg['dataset']} dataloaders...")
+
+    train_loader, train_val_loader, val_loader, test_loader = build_loaders(
+        cfg, dataset, model.train_tfm, model.eval_tfm, return_train_eval=True)
+
+    if args.resume:
+        saved_cfg = load_checkpoint(model, args.resume)
+    elif cfg["use_op"]:
+        model.create_bank(train_val_loader)
+        
+    if args.eval_only:
+        acc = evaluate_mlp(model, test_loader, device, alpha=cfg['alpha'])
+        val_acc, best_params = model.tune_hyperparameters(train_val_loader, device=device)
+        acc_tuned = evaluate_mlp(model, test_loader, device, alpha=best_params[0])
+        logger.info(f"Best Hyparparams: alpha={best_params[0]}")
+        logger.info(f"Test Accuracy (Before tuning): {acc:.2f}%")
+        logger.info(f"Test Accuracy (After tuning): {acc_tuned:.2f}%")
+        return
+
+    params = model.adapter.parameters() if not cfg["text_adapter"] \
+        else list(model.adapter.parameters()) + list(model.t_adapter.parameters())
+    optimizer = torch.optim.AdamW(params, lr=cfg['lr'], weight_decay=cfg['wd'])
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg['epochs'])
+
+    best_acc = 0.0
+    eval_freq = cfg.get('eval_freq', cfg['epochs'])
+    for epoch in range(1, cfg['epochs'] + 1):
+        loss = train_one_epoch(model, train_loader, optimizer, epoch, device)
+        if scheduler is not None:
+            scheduler.step()
+        
+        if epoch % eval_freq == 0:
+            logger.info(f"--- Fast Evaluation at Epoch {epoch} ---")
+            if cfg['dataset'] != "VinDrCXR":
+                acc = evaluate_mlp(model, test_loader, device, alpha=cfg['alpha'])
+                logger.info(f"Test Accuracy: {acc:.2f}%")
+                if acc > best_acc:
+                    best_acc = acc
+            else:
+                logger.info("Multi-label evaluate skipped - not stubbed yet")
+
+    save_checkpoint(model, optimizer, scheduler, cfg, epoch, args.output_dir, is_best=True)
+
+    if cfg['dataset'] != "VinDrCXR":
+        acc = evaluate_mlp(model, test_loader, device, alpha=cfg['alpha'])
+
+        logger.info("Hyparparams tuning...")
+        val_acc, best_params = model.tune_hyperparameters(val_loader, device=device)
+        logger.info(f"Best Hyparparams: alpha={best_params[0]}")
+
+        acc_tuned = evaluate_mlp(model, test_loader, device, alpha=best_params[0])
+        logger.info(f"Test Accuracy (Before tuning): {acc:.2f}%")
+        logger.info(f"Test Accuracy (After tuning): {acc_tuned:.2f}%")
+    else:
+        logger.info("Multi-label evaluation not fully stubbed for MLP baseline yet.")
+        pass
+
+    return
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        import logging
+        logger = logging.getLogger("FlowAdapter")
+        logger.exception("An error occurred during execution:")
+        raise

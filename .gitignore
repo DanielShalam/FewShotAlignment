@@ -1,0 +1,16 @@
+# Experiment outputs
+output/
+
+# Explicitly excluded files
+main_bpa.py
+run_depth_fsf.py
+run_depth_fsf_v3.py
+src/model_bpa.py
+src/model copy.py
+
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+
+# IDE metadata
+.idea/

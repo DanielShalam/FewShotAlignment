@@ -1,0 +1,29 @@
+dataset: "EuroSAT"
+root: "../datasets"
+shots: 16
+seed: 42
+
+# Training
+epochs: 200
+lr: 0.00001
+wd: 0.00001
+batch_size: 32
+eval_freq: 40
+num_workers: 8
+
+# Model / Flow
+fm_type: "geodesic"
+inv_fm_type: "adapter"
+use_op: True
+pretrained_op: ""
+text_adapter: True
+ada_depth: 4
+ada_dim: 1536
+ada_t_dim: 256
+alpha: 0. # blending ratio for eval
+
+txt_src: "openai"
+txt_model: "ViT-B/16"
+
+img_src: "HF"
+img_model: "facebook/dinov2-base"
