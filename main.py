@@ -1,13 +1,34 @@
 import argparse
 import os
 from pathlib import Path
+import copy
 import yaml
 import torch
 from src.utils import setup_logger, set_seed, save_checkpoint, load_checkpoint
 
-from src.datasets.base_dataset import build_dataset, build_loaders
-from src.model import FlowAdapter, MultiLabelFlowAdapter
+from src.datasets.base_dataset import build_dataset, build_loaders, DatasetWrapper
+from src.model import FlowAdapter, MultiLabelFlowAdapter, GuidedVelocity
 from src.engine import train_one_epoch, evaluate, evaluate_multilabel
+
+"""
+OOD:
+FSA:
+python main.py --config configs/ablation.yaml --eval_only --resume output/ImageNet/ablation/seed_42/shots_16/model_best.pth dataset ImageNet ood_dataset ImageNetR shots 16 seed 42
+python main.py --config configs/ablation.yaml --eval_only --resume output/ImageNet/ablation/seed_42/shots_16/model_best.pth dataset ImageNet ood_dataset ImageNetA shots 16 seed 42
+
+MLP:
+python main_mlp.py --config configs/ablation_noop.yaml dataset SUN397 shots 16 seed 42
+python main_mlp.py --config configs/ablation_noop.yaml dataset SUN397 shots 4 seed 42
+
+MLP + OP:
+python main_mlp.py --config configs/ablation.yaml dataset SUN397 shots 16 seed 42
+python main_mlp.py --config configs/ablation.yaml dataset SUN397 shots 4 seed 42
+
+Residual MLP + op:
+python main_mlp.py --config configs/res.yaml dataset SUN397 shots 16 seed 42 - next 16
+python main_mlp.py --config configs/res.yaml dataset SUN397 shots 4 seed 42
+
+"""
 
 
 def get_args():
@@ -53,8 +74,24 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Dataset
-    dataset = build_dataset(cfg)
-    cfg["classnames"] = dataset.classnames
+    ood_dataset_name = cfg.get("ood_dataset", None)
+    use_ood_eval = isinstance(ood_dataset_name, str) and len(ood_dataset_name) > 0
+
+    train_cfg = copy.deepcopy(cfg)
+    dataset = build_dataset(train_cfg)
+    if use_ood_eval:
+        # OOD protocol: train/val always on ImageNet, test on selected ImageNet variant.
+        train_cfg["dataset"] = "ImageNet"
+        logger.info(f"OOD mode enabled: train/val dataset=ImageNet, test dataset={ood_dataset_name}")
+
+        test_cfg = copy.deepcopy(train_cfg)
+        test_cfg["dataset"] = ood_dataset_name
+        ood_dataset = build_dataset(test_cfg)
+        cfg["classnames"] = ood_dataset.classnames
+        cfg["dataset"] = ood_dataset_name
+    else:
+        cfg["classnames"] = dataset.classnames
+        cfg["dataset"] = train_cfg["dataset"]
 
     # Model
     if cfg["dataset"] != "VinDrCXR":
@@ -65,7 +102,18 @@ def main():
     # Data
     logger.info(f"Building {cfg['dataset']} dataloaders...")
     train_loader, train_val_loader, val_loader, test_loader = build_loaders(
-        cfg, dataset, model.train_tfm, model.eval_tfm, return_train_eval=True)
+        train_cfg, dataset, model.train_tfm, model.eval_tfm, return_train_eval=True)
+
+    if use_ood_eval:
+        test_loader = torch.utils.data.DataLoader(
+            DatasetWrapper(test_cfg, ood_dataset.test, transform=model.eval_tfm, is_train=False),
+            batch_size=test_cfg["batch_size"],
+            num_workers=test_cfg["num_workers"],
+            drop_last=False,
+            pin_memory=True,
+        )
+        
+        
     logger.info(
         f"Loader sizes: train_batches={len(train_loader)}, train_eval_batches={len(train_val_loader)}, "
         f"val_batches={len(val_loader) if val_loader is not None else 0}, test_batches={len(test_loader)}"
@@ -74,6 +122,7 @@ def main():
     # Linear alignment matrix (OP). Auto-load if resuming, or create it
     if args.resume:
         saved_cfg = load_checkpoint(model, args.resume)
+        # model.create_bank(train_val_loader)
         # Note: load_checkpoint loads state_dict, which includes OP.W
     else:
         # Create support bank (Proto calculation + OP fitting)
@@ -81,12 +130,30 @@ def main():
 
     # Eval Only Mode
     if args.eval_only:
-        acc = evaluate(model, test_loader, device, alpha=cfg['alpha'], t_end=1.)
-        logger.info(f"Test Accuracy (Before tuning): {acc:.2f}%")
+        base_model = copy.deepcopy(model.adapter.vecfield)
+        txt_feats = model.text_encoder.text_features.to(device)
+        txt_feats = torch.nn.functional.normalize(txt_feats @ model.OP.W.float().to(device), dim=-1)
+        for t_end in [0.05, 0.1, 0.25, 0.5, 1.]:
+            for guidance_scale in [0., 0.1, 0.25, 0.5, 1.0]:
+                model.adapter.vecfield = GuidedVelocity(
+                    base_model=base_model, 
+                    txt_feats=txt_feats,
+                    guidance_scale=guidance_scale, 
+                    logit_scale=1.,
+                )
+                acc = evaluate(model, test_loader, device, alpha=cfg['alpha'], t_end=t_end, steps=4)
+                print(f"Test Accuracy with t_end={t_end}, guidance_scale={guidance_scale}: {acc:.2f}%")
+        model.adapter.vecfield = GuidedVelocity(
+            base_model=base_model, 
+            txt_feats=txt_feats, 
+            guidance_scale=1., logit_scale=1.,
+            )
+        acc = evaluate(model, test_loader, device, alpha=cfg['alpha'])
+        print(f"Test Accuracy (Before tuning): {acc:.2f}%")
         val_acc, best_params = model.tune_hyperparameters(val_loader, device=device)
         acc_tuned = evaluate(model, test_loader, device, alpha=best_params[0], t_end=best_params[1])
-        logger.info(f"Best Hyparparams: alpha={best_params[0]}, timestep={best_params[1]}")
-        logger.info(f"Test Accuracy (After tuning): {acc_tuned:.2f}%")
+        print(f"Best Hyparparams: alpha={best_params[0]}, timestep={best_params[1]}")
+        print(f"Test Accuracy (After tuning): {acc_tuned:.2f}%")
         return
 
     # Training
@@ -98,8 +165,19 @@ def main():
     best_acc = 0.0
     eval_freq = cfg.get('eval_freq', cfg['epochs']) # Default to only evaluating at the end if not specified
     train_multi_map = dataset.multi_map if cfg['dataset'] == "VinDrCXR" else None
+    grad_clip = float(cfg.get('grad_clip', 0.0))
+    if grad_clip > 0:
+        logger.info(f"Gradient clipping enabled with max_norm={grad_clip} (L2 norm)")
     for epoch in range(1, cfg['epochs'] + 1):
-        loss = train_one_epoch(model, train_loader, optimizer, epoch, device, multi_map=train_multi_map)
+        loss = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            epoch,
+            device,
+            multi_map=train_multi_map,
+            grad_clip=grad_clip,
+        )
         if scheduler is not None:
             scheduler.step()
         

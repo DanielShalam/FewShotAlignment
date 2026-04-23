@@ -4,7 +4,7 @@ from tqdm import tqdm
 from sklearn.metrics import average_precision_score, roc_auc_score
 
 
-def train_one_epoch(model, loader, optimizer, epoch, device, multi_map=None):
+def train_one_epoch(model, loader, optimizer, epoch, device, multi_map=None, grad_clip=0.0):
     model.train()
     num_batches = len(loader)
     if num_batches == 0:
@@ -30,6 +30,8 @@ def train_one_epoch(model, loader, optimizer, epoch, device, multi_map=None):
 
         optimizer.zero_grad()
         loss.backward()
+        if grad_clip is not None and float(grad_clip) > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(grad_clip), norm_type=2.0)
         optimizer.step()
 
         total_loss += loss.item()
@@ -38,8 +40,8 @@ def train_one_epoch(model, loader, optimizer, epoch, device, multi_map=None):
     return total_loss / num_batches
 
 
-@torch.inference_mode()
-def evaluate(model, loader, device, alpha=0., t_end=0.5):
+@torch.no_grad()
+def evaluate(model, loader, device, alpha=0., t_end=0.5,  solver='midpoint', steps=2):
     model.eval()
     correct = 0
     total = 0
@@ -48,7 +50,7 @@ def evaluate(model, loader, device, alpha=0., t_end=0.5):
         images = batch['img'].to(device)
         labels = batch['label'].to(device)
 
-        out = model(images, t_end=t_end, solver='dopri5')  # Returns dict {'ZS': ..., 'MT': ...}
+        out = model(images, t_end=t_end, solver=solver, steps=steps)  # Returns dict {'ZS': ..., 'MT': ...}
 
         # Ensemble logits
         logits = (1 - alpha) * out['MT'] + alpha * out['ZS']
@@ -60,7 +62,7 @@ def evaluate(model, loader, device, alpha=0., t_end=0.5):
     return 100. * correct / total
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def evaluate_multilabel(model, loader, multi_map, device, alpha=0., t_end=0.5, solver="dopri5"):
     model.eval()
 
@@ -96,7 +98,7 @@ def evaluate_multilabel(model, loader, multi_map, device, alpha=0., t_end=0.5, s
         "macro_AUROC": macro_auc
     }
 
-@torch.inference_mode()
+@torch.no_grad()
 def evaluate_mlp(model, loader, device, alpha=0., **kwargs):
     model.eval()
     correct = 0

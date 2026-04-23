@@ -178,5 +178,21 @@ class HFImageEncoder(nn.Module):
         else:
             image_features = self.img_model(pixel_values)[0][:, 0, :]     # [CLS] token embedding
 
+            # model_out = self.img_model(pixel_values, output_hidden_states=True)
+            # image_features = model_out[0][:, 0, :]     # [CLS] token embedding
+            # for i in range(2, 5):
+            #     image_features += self.img_model.layernorm(model_out.hidden_states[-i][:, 0, :])
+            # image_features /= 4.
+
+            # cls_token = F.normalize(model_out[0][:, 0, :], dim=-1)
+            # if True or self.training:
+            #     patch_tokens = F.normalize(model_out[0][:, 1:, :].mean(1), dim=-1)  # Mean pool patch tokens
+            #     image_features = (F.softmax(cls_token @ patch_tokens.t() * 10., dim=-1) @ cls_token)  # Attention pooling of patch tokens, weighted by CLS-token attention scores
+            # else:
+            #     patch_tokens = F.normalize(model_out[0][:, 1:, :], dim=-1)
+            #     attn = torch.einsum('bd,bnd->bn', cls_token, patch_tokens) * 10.
+            #     attn = F.softmax(attn, dim=-1)                        # [B, N]
+            #     image_features = torch.einsum('bn,bnd->bd', attn, patch_tokens)  # [B, D]
+
         return F.normalize(image_features, dim=1) if normalize else image_features
 

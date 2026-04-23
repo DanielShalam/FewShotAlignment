@@ -10,6 +10,7 @@ wd: 0.00001
 batch_size: 32
 eval_freq: 40
 num_workers: 8
+grad_clip: 0.0
 
 # Model / Flow
 fm_type: "geodesic"

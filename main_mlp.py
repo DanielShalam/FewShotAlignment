@@ -1,11 +1,12 @@
 import argparse
 import os
 from pathlib import Path
+import copy
 import yaml
 import torch
 from src.utils import setup_logger, set_seed, save_checkpoint, load_checkpoint
 
-from src.datasets.base_dataset import build_dataset, build_loaders
+from src.datasets.base_dataset import build_dataset, build_loaders, DatasetWrapper
 from src.model import ContrastiveMLPAdapter
 from src.engine import train_one_epoch, evaluate_mlp
 
@@ -49,15 +50,48 @@ def main():
     set_seed(cfg['seed'])
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    dataset = build_dataset(cfg)
-    cfg["classnames"] = dataset.classnames
+    ood_dataset_name = cfg.get("ood_dataset", None)
+    use_ood_eval = isinstance(ood_dataset_name, str) and len(ood_dataset_name) > 0
+
+    train_cfg = copy.deepcopy(cfg)
+    dataset = build_dataset(train_cfg)
+    if use_ood_eval:
+        # OOD protocol: train/val always on ImageNet, test on selected ImageNet variant.
+        train_cfg["dataset"] = "ImageNet"
+        logger.info(f"OOD mode enabled: train/val dataset=ImageNet, test dataset={ood_dataset_name}")
+
+        test_cfg = copy.deepcopy(train_cfg)
+        test_cfg["dataset"] = ood_dataset_name
+        ood_dataset = build_dataset(test_cfg)
+        cfg["classnames"] = ood_dataset.classnames
+        cfg["dataset"] = ood_dataset_name
+    else:
+        cfg["classnames"] = dataset.classnames
+        cfg["dataset"] = train_cfg["dataset"]
 
     model = ContrastiveMLPAdapter(cfg).to(device)
 
     logger.info(f"Building {cfg['dataset']} dataloaders...")
 
     train_loader, train_val_loader, val_loader, test_loader = build_loaders(
-        cfg, dataset, model.train_tfm, model.eval_tfm, return_train_eval=True)
+        train_cfg, dataset, model.train_tfm, model.eval_tfm, return_train_eval=True)
+
+    if use_ood_eval:
+        test_cfg = copy.deepcopy(train_cfg)
+        test_cfg["dataset"] = ood_dataset_name
+        ood_dataset = build_dataset(test_cfg)
+        test_loader = torch.utils.data.DataLoader(
+            DatasetWrapper(test_cfg, ood_dataset.test, transform=model.eval_tfm, is_train=False),
+            batch_size=test_cfg["batch_size"],
+            num_workers=test_cfg["num_workers"],
+            drop_last=False,
+            pin_memory=True,
+        )
+
+    logger.info(
+        f"Loader sizes: train_batches={len(train_loader)}, train_eval_batches={len(train_val_loader)}, "
+        f"val_batches={len(val_loader) if val_loader is not None else 0}, test_batches={len(test_loader)}"
+    )
 
     if args.resume:
         saved_cfg = load_checkpoint(model, args.resume)
@@ -66,11 +100,11 @@ def main():
         
     if args.eval_only:
         acc = evaluate_mlp(model, test_loader, device, alpha=cfg['alpha'])
+        print(f"Test Accuracy (Before tuning): {acc:.2f}%")
         val_acc, best_params = model.tune_hyperparameters(val_loader, device=device)
         acc_tuned = evaluate_mlp(model, test_loader, device, alpha=best_params[0])
-        logger.info(f"Best Hyparparams: alpha={best_params[0]}")
-        logger.info(f"Test Accuracy (Before tuning): {acc:.2f}%")
-        logger.info(f"Test Accuracy (After tuning): {acc_tuned:.2f}%")
+        print(f"Best Hyparparams: alpha={best_params[0]}")
+        print(f"Test Accuracy (After tuning): {acc_tuned:.2f}%")
         return
 
     params = model.adapter.parameters() if not cfg["text_adapter"] \
@@ -80,8 +114,18 @@ def main():
 
     best_acc = 0.0
     eval_freq = cfg.get('eval_freq', cfg['epochs'])
+    grad_clip = float(cfg.get('grad_clip', 0.0))
+    if grad_clip > 0:
+        logger.info(f"Gradient clipping enabled with max_norm={grad_clip} (L2 norm)")
     for epoch in range(1, cfg['epochs'] + 1):
-        loss = train_one_epoch(model, train_loader, optimizer, epoch, device)
+        loss = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            epoch,
+            device,
+            grad_clip=grad_clip,
+        )
         if scheduler is not None:
             scheduler.step()
         

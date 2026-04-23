@@ -17,7 +17,8 @@ class ImageNetSketch(DatasetBase):
     dataset_dir = "imagenet-sketch"
 
     def __init__(self, cfg):
-        root = os.path.abspath(os.path.expanduser(cfg["root"]))
+        # root = os.path.abspath(os.path.expanduser(cfg["root"]))
+        root = "/root/.cache/kagglehub/datasets/wanghaohan/imagenetsketch/versions/1/"
         self.dataset_dir = os.path.join(root, self.dataset_dir)
         self.image_dir = os.path.join(self.dataset_dir, "images")
 
