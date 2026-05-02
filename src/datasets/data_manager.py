@@ -62,7 +62,7 @@ def build_loaders(cfg, dataset, train_tfm, eval_tfm, return_train_eval=False):
     train_loader = torch.utils.data.DataLoader(
         DatasetWrapper(cfg, dataset.train_x, transform=train_tfm, is_train=True),
         batch_size=cfg["batch_size"], num_workers=cfg["num_workers"],
-        drop_last=True, pin_memory=True,
+        drop_last=True, pin_memory=True, shuffle=True,
     )
     # Build val_loader
     val_loader = None

@@ -93,7 +93,13 @@ def _dicom_to_png_cached(dicom_path: Path, cache_png_root: Path) -> str:
     rel = dicom_path.name.replace(".dicom", ".png")
     dst = cache_png_root / rel
     if dst.exists():
-        return str(dst)
+        try:
+            with Image.open(dst) as img:
+                img.verify()
+            return str(dst)
+        except Exception:
+            # Corrupted cache file from a previous killed run, delete it
+            dst.unlink(missing_ok=True)
 
     try:
         import pydicom
@@ -199,6 +205,7 @@ TO_CLEAN6 = {
     "Pulmonary fibrosis": "Pulmonary Fibrosis",
     "Tuberculosis": "Tuberculosis",
     "Pleural effusion": "Pleural Effusion",
+    "No finding": "No finding",
 }
 
 def _normalize_labels(raw_labels: List[str]) -> List[str]:
@@ -283,17 +290,16 @@ class VinDrCXR(DatasetBase):
                 raise FileNotFoundError(f"[VinDrCXR] Missing path: {p}")
 
         # Options
-        opt = getattr(cfg, "VINDR", None)
-        use_clean6 = bool(getattr(opt, "USE_CLEAN6", True)) if opt else True
-        drop_no_finding = bool(getattr(opt, "DROP_NO_FINDING", True)) if opt else True
-        primary_strategy = (getattr(opt, "PRIMARY_STRATEGY", "rare") if opt else "rare")
-        val_per_class = int(getattr(opt, "VAL_SIZE_PER_CLASS", 4) if opt else 4)
-        cache_subdir = getattr(opt, "DICOM_CACHE_SUBDIR", "_png_cache") if opt else "_png_cache"
-        agg_policy = (getattr(opt, "AGG", "ANY") if opt else "ANY")  # "ANY" or "MAJORITY"
+        use_clean6 = cfg.get("USE_CLEAN6", True)
+        drop_no_finding = bool(cfg.get("DROP_NO_FINDING", True))
+        primary_strategy = cfg.get("PRIMARY_STRATEGY", "rare")
+        val_per_class = int(cfg.get("VAL_SIZE_PER_CLASS", 16))
+        cache_subdir = cfg.get("DICOM_CACHE_SUBDIR", "_png_cache")
+        agg_policy = cfg.get("AGG", "ANY")  # "ANY" or "MAJORITY"
 
         # label space
         if use_clean6:
-            classnames = CLEAN6.copy()
+            classnames = CLEAN6.copy() + (["No finding"] if not drop_no_finding else [])
             allowed = set(TO_CLEAN6.values())
         else:
             classnames = [c for c in VINDR_LABELS if (drop_no_finding is False or c != "No finding")]
@@ -310,15 +316,6 @@ class VinDrCXR(DatasetBase):
 
         name2labels_tr = _read_csv_labels(tr_csv, agg=agg_policy)
         name2labels_te = _read_csv_labels(te_csv, agg=agg_policy)
-
-        # # Normalize labels
-        # def norm_map(d: Dict[str, List[str]]) -> Dict[str, List[str]]:
-        #     out = {}
-        #     for k, v in d.items():
-        #         out[k] = _normalize_labels(v)
-        #     return out
-        # name2labels_tr = norm_map(name2labels_tr)
-        # name2labels_te = norm_map(name2labels_te)
 
         # If using clean-6, collapse normalized labels to the clean6 set
         if use_clean6:
@@ -361,7 +358,7 @@ class VinDrCXR(DatasetBase):
                     freq[l] += 1
 
         # Few-shot split (deterministic)
-        rng = random.Random(int(getattr(cfg, "SEED", 1)))
+        rng = random.Random(int(cfg.get("seed", 1)))
 
         # Group train images by primary label
         per_class = defaultdict(list)
@@ -374,19 +371,30 @@ class VinDrCXR(DatasetBase):
                 drop_no_finding=drop_no_finding
             )
             if primary is None:
-                continue
+                primary = "No finding"
+                # continue
             per_class[primary].append(img_id)
 
         # Draw shots + validation per class
-        shots = int(getattr(cfg, "shots", 1))
+        shots = cfg.get("shots", 1)
+        total_random = cfg.get("RANDOM_SAMPLE_N", None)
+        
         tr_names, val_names = [], []
-        for c in classnames:
-            items = per_class.get(c, [])
-            rng.shuffle(items)
-            tr_slice  = items[:shots]
-            val_slice = items[shots: shots + min(shots, val_per_class)]
-            tr_names.extend(tr_slice)
-            val_names.extend(val_slice)
+        if total_random is not None:
+            all_items = []
+            for c in classnames:
+                all_items.extend(per_class.get(c, []))
+            rng.shuffle(all_items)
+            tr_names = all_items[:int(total_random)]
+            val_names = all_items[int(total_random):int(total_random) + len(classnames) * val_per_class]
+        else:
+            for c in classnames:
+                items = per_class.get(c, [])
+                rng.shuffle(items)
+                tr_slice  = items[:shots]
+                val_slice = items[shots: shots + min(shots, val_per_class)]
+                tr_names.extend(tr_slice)
+                val_names.extend(val_slice)
 
         # Build cached PNG paths
         cache_train = base / cache_subdir / "train"
@@ -405,7 +413,8 @@ class VinDrCXR(DatasetBase):
                 return None
             try:
                 return _dicom_to_png_cached(dicom_path, cache_root)
-            except Exception:
+            except Exception as e:
+                print(f"DEBUG: Pydicom Exception on {dicom_path.name}: {e}")
                 return None
 
         # Build Datum lists
@@ -425,7 +434,9 @@ class VinDrCXR(DatasetBase):
                     drop_no_finding=drop_no_finding
                 )
                 if primary is None:
-                    continue
+                    if drop_no_finding:
+                        continue
+                    primary = "No finding"
                 out.append(Datum(impath=imp, label=CLASS2IDX[primary], classname=primary))
             if miss > 0:
                 print(f"[VinDrCXR] Warning: {miss} train files failed to convert/read (skipped).")
@@ -443,10 +454,12 @@ class VinDrCXR(DatasetBase):
                 primary = _choose_primary_label(
                     labs, list(allowed), freq,
                     strategy=primary_strategy,
-                    drop_no_finding=drop_no_finding
+                    drop_no_finding=drop_no_finding,
                 )
                 if primary is None:
-                    continue
+                    if drop_no_finding:
+                        continue
+                    primary = "No finding"
                 out.append(Datum(impath=imp, label=CLASS2IDX[primary], classname=primary))
             if miss > 0:
                 print(f"[VinDrCXR] Warning: {miss} test files failed to convert/read (skipped).")
@@ -461,7 +474,7 @@ class VinDrCXR(DatasetBase):
         print("[VinDrCXR] Building test ...")
         test = build_test_all(name2labels_te)
 
-        self._six = CLEAN6
+        self._six = CLEAN6 + ["No finding"] if drop_no_finding is False else CLEAN6
         self._six2idx = {c: i for i, c in enumerate(self._six)}
 
         # image_id -> list[str] positives (after your ANY/MAJORITY aggregation)
@@ -486,11 +499,11 @@ class VinDrCXR(DatasetBase):
             self.multi_map[d.impath] = labels_to_multi(labs)
 
         # optional: class frequencies on train_x for pos_weight
-        cnt = torch.zeros(len(CLEAN6))
+        cnt = torch.zeros(len(CLEAN6) + 1 if drop_no_finding is False else len(CLEAN6))
         for d in train_x:
             cnt += self.multi_map[d.impath]
         self.train_pos_counts = cnt  # tensor[6]
-        self.train_num = max(1, len(train_x))
+        self.train_num = len(train_x)
 
         # Summary
         def per_class_counts(data: List[Datum]) -> Dict[str, int]:

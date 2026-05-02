@@ -1,21 +1,21 @@
-dataset: "EuroSAT"
-root: "../datasets"
+dataset: "VinDrCXR"
+root: "/root/datasets/vindr_cxr/physionet.org/files/vindr-cxr/1.0.0/"
 shots: 16
 seed: 42
 
 # Training
 epochs: 200
-lr: 0.00001
-wd: 0.00001
+lr: 0.0001
+wd: 0.001
 batch_size: 32
-eval_freq: 40
+eval_freq: 50
 num_workers: 8
 grad_clip: 0.0
 
 # Model / Flow
 fm_type: "geodesic"
 inv_fm_type: "adapter"
-use_op: False
+use_op: True
 pretrained_op: ""
 text_adapter: False
 ada_depth: 4
@@ -23,8 +23,8 @@ ada_dim: 1536
 ada_t_dim: 256
 alpha: 0. # blending ratio for eval
 
-txt_src: "openai"
-txt_model: "ViT-B/16"
+txt_src: "HF"
+txt_model: "Qwen/Qwen3-Embedding-0.6B"
 
 img_src: "HF"
-img_model: "facebook/dinov2-base"
+img_model: "microsoft/rad-dino"

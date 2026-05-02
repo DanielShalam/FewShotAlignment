@@ -1,4 +1,4 @@
-dataset: "EuroSAT"
+dataset: "FGVCAircraft"
 root: "../datasets"
 shots: 16
 seed: 42
@@ -10,18 +10,22 @@ wd: 0.00001
 batch_size: 32
 eval_freq: 40
 num_workers: 8
-grad_clip: 0.0
+grad_clip: 0.
 
 # Model / Flow
 fm_type: "geodesic"
 inv_fm_type: "adapter"
-use_op: False
+use_op: True
 pretrained_op: ""
 text_adapter: False
+use_residual: True 
 ada_depth: 4
 ada_dim: 1536
 ada_t_dim: 256
+train_time_samples: 1
 alpha: 0. # blending ratio for eval
+use_context: False
+use_final_layer_head: False
 
 txt_src: "openai"
 txt_model: "ViT-B/16"

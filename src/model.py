@@ -103,13 +103,17 @@ def slerp(u: torch.Tensor, v: torch.Tensor, lam: torch.Tensor, eps: float = 1e-7
 
     return F.normalize(out, p=2, dim=-1)
 @torch.inference_mode()
-def make_support_bank(visual, support_loader):
+def make_support_bank(visual, support_loader, multi_map=None):
     visual.eval()
     feats, labels = [], []
     for b in support_loader:
         f = F.normalize(visual(b['img'].cuda()), dim=-1)
         feats.append(f.cpu())
-        labels.append(b['label'])
+        if multi_map is not None:
+            impaths = b["impath"]
+            labels.append(torch.stack([multi_map[p] for p in impaths], 0))
+        else:
+            labels.append(b['label'])
     return torch.cat(feats).cuda(), torch.cat(labels).cuda()  # [Ns,D], [Ns]
 @torch.no_grad()
 def build_class_prototypes(feats, labels, num_classes):
@@ -120,7 +124,10 @@ def build_class_prototypes(feats, labels, num_classes):
     protos = torch.zeros(num_classes, D, device=feats.device, dtype=feats.dtype)
     counts = torch.zeros(num_classes, device=feats.device, dtype=feats.dtype)
     for c in range(num_classes):
-        mask = (labels == c)
+        if labels.dim() > 1:
+            mask = (labels[:, c] > 0)
+        else:
+            mask = (labels == c)
         if mask.any():
             protos[c] = feats[mask].mean(dim=0)
             counts[c] = mask.float().sum()
@@ -488,6 +495,111 @@ class SimpleMLP(nn.Module):
 
         return x
 
+# ─── Sphere-aware adapter ────────────────────────────────────────────────────
+
+class SphereResBlock(nn.Module):
+    """Residual block that keeps intermediate representations on the sphere.
+
+    Flow:
+        1. Inject time embedding via scale+shift (no LayerNorm)
+        2. Linear → SiLU → Linear in tangent space
+        3. Geodesic residual: expmap(x, h) instead of x + h
+    """
+
+    EPS = 1e-5
+
+    def __init__(self, channels, mid_channels, emb_channels, dropout=0.):
+        super().__init__()
+        self.time_mlp = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(emb_channels, 2 * channels),
+        )
+        self.net = nn.Sequential(
+            nn.Linear(channels, mid_channels),
+            nn.SiLU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(mid_channels, channels),
+        )
+        # Zero-init last layer so block starts as identity (expmap(x, 0) = x)
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def _proju(self, x, u):
+        return u - (u * x).sum(-1, keepdim=True) * x
+
+    def _expmap(self, x, u):
+        norm_u = u.norm(dim=-1, keepdim=True).clamp(min=self.EPS)
+        return x * torch.cos(norm_u) + u * (torch.sin(norm_u) / norm_u)
+
+    def forward(self, x, emb):
+        scale, shift = self.time_mlp(emb).chunk(2, dim=-1)
+        h = x * (1. + scale) + shift
+        h = self.net(h)
+        h = self._proju(x, h)
+        x_new = self._expmap(x, h)
+        return F.normalize(x_new, dim=-1)
+
+
+class SphereMLP(nn.Module):
+    """Sphere-aware velocity network.
+
+    All intermediate representations stay on the unit sphere via geodesic
+    residual connections (expmap). No LayerNorm. Outputs a tangent vector
+    at the input point.
+
+    Same interface as SimpleMLP: forward(t, x, y=None) -> velocity [B, D].
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        time_embed_dim,
+        model_channels,
+        bottleneck_channels,
+        out_channels,
+        num_res_blocks,
+        dropout=0,
+        use_context=False,
+        context_channels=512,
+        use_final_layer_head=False,
+    ):
+        super().__init__()
+        self.time_encoder = GaussianFourierProjection(model_channels)
+        self.time_embed = nn.Sequential(
+            nn.Linear(model_channels, time_embed_dim),
+            nn.SiLU(),
+            nn.Linear(time_embed_dim, time_embed_dim),
+        )
+        self.res_blocks = nn.ModuleList([
+            SphereResBlock(in_channels, bottleneck_channels, time_embed_dim, dropout)
+            for _ in range(num_res_blocks)
+        ])
+        # Velocity head: takes [x_input; x_transformed] → tangent vector
+        self.vel_head = nn.Sequential(
+            nn.Linear(in_channels * 2, bottleneck_channels),
+            nn.SiLU(),
+            nn.Linear(bottleneck_channels, out_channels),
+        )
+        nn.init.zeros_(self.vel_head[-1].weight)
+        nn.init.zeros_(self.vel_head[-1].bias)
+
+    def forward(self, t, x, y=None):
+        x_input = F.normalize(x, dim=-1)
+
+        if t.ndim == 2:
+            t = t.squeeze(-1)
+        if t.dim() == 0:
+            t = t.repeat(x.shape[0])
+
+        emb = self.time_embed(self.time_encoder(t))
+
+        h = x_input
+        for block in self.res_blocks:
+            h = block(h, emb)
+
+        vel = self.vel_head(torch.cat([x_input, h], dim=-1))
+        return vel
+
 class ProjectToTangent(torch.nn.Module):
     """Projects a vector field onto the tangent plane at the input."""
 
@@ -563,6 +675,29 @@ class OrthogonalProcrustes(nn.Module):
             else: y = self.apply_zero_padding(y, dx)
         return F.normalize(x @ self.W.float().to(x.device), dim=-1), y
 
+# Inside _solve_ode, replace the plain velocity model with a guided one:
+class GuidedVelocity(nn.Module):
+    def __init__(self, base_model, txt_feats, guidance_scale, logit_scale):
+        super().__init__()
+        self.base_model = base_model
+        self.txt_feats = txt_feats  # [C, D]
+        self.w = guidance_scale
+        self.s = logit_scale
+
+    def forward(self, t, x, **kwargs):
+        v = self.base_model(t, x, **kwargs)
+        if self.w == 0:
+            return v
+        # classifier gradient on the sphere
+        with torch.enable_grad():
+            x_g = x.detach().requires_grad_(True)
+            logits = self.s * (x_g @ self.txt_feats.to(x.device).detach().T)
+            log_prob = logits.log_softmax(dim=-1).max(dim=-1).values.sum()
+            grad = torch.autograd.grad(log_prob, x_g)[0]
+
+        # project gradient to tangent space of sphere (remove radial component)
+        grad = grad - (grad * x).sum(-1, keepdim=True) * x
+        return v + self.w * grad
 
 # Flow-Adapter
 class FlowAdapter(nn.Module):
@@ -598,11 +733,12 @@ class FlowAdapter(nn.Module):
         )
 
         # I2T adapter
-        self.adapter = SimpleMLP(**ada_kwargs)
+        self.adapter = SphereMLP(**ada_kwargs)
+        print(self.adapter)
 
         # T2I adapter (optional)
         if cfg["text_adapter"]:
-            self.t_adapter = SimpleMLP(**ada_kwargs)    # text to image adapter
+            self.t_adapter = SphereMLP(**ada_kwargs)    # text to image adapter
 
         # 4. Flow Matching Setup
         if cfg["fm_type"] == "geodesic":
@@ -690,14 +826,14 @@ class FlowAdapter(nn.Module):
         return text_encoder, image_encoder, train_tfm, eval_tfm
 
     @torch.inference_mode()
-    def create_bank(self, loader, op_beta=None):
+    def create_bank(self, loader, op_beta=None, multi_map=None):
         """
         support_items: the EXACT k-shot training items (per class) you will train on.
                        (No val items here to keep protocol clean.)
         """
 
         # compute support features in the SAME space you'll use at train/eval
-        self.bank_feat, self.bank_labels = make_support_bank(visual=self.image_encoder, support_loader=loader)
+        self.bank_feat, self.bank_labels = make_support_bank(visual=self.image_encoder, support_loader=loader, multi_map=multi_map)
 
         #  class prototypes (image space)
         num_classes = self.text_encoder.text_features.size(0)
@@ -726,6 +862,11 @@ class FlowAdapter(nn.Module):
         # 1. Encode
         img_feats = F.normalize(self.image_encoder(images), dim=-1)
         txt_feats = F.normalize(self.text_encoder().clone().detach(), dim=-1)
+        # img_feats = (F.softmax(img_feats @ self.bank_feat.t() * 100., dim=-1) @ self.bank_feat)
+        
+        protos = self.bank_prototypes
+        if self.training and labels is not None:
+            txt_feats = F.normalize((txt_feats + 0.01 * torch.randn_like(txt_feats)).detach(), dim=-1)  # add small noise for stability in multi-label case
 
         # 2. Apply OP
         txt_feats, img_feats = self.OP.transform(x=txt_feats, y=img_feats)
@@ -734,16 +875,55 @@ class FlowAdapter(nn.Module):
         # 3. Training Mode
         if self.training and labels is not None:
             # conditional-flow-matching loss
+            # def cfm_loss(v_model, x_0, x_1, y=None):
+            #     k = max(1, self.train_time_samples)
+            #     if k > 1:
+            #         x_0 = x_0.repeat_interleave(k, dim=0)
+            #         x_1 = x_1.repeat_interleave(k, dim=0)
+            #     t = torch.rand(x_0.shape[0], device=x_0.device)  # sample timestep(s)
+            #     p_s = self.path.sample(t=t, x_0=x_0, x_1=x_1)  # sample path
+            #     vt = v_model(p_s.t, p_s.x_t, y=y)
+            #     return torch.pow(vt - p_s.dx_t, 2).mean()
             def cfm_loss(v_model, x_0, x_1, y=None):
                 k = max(1, self.train_time_samples)
                 if k > 1:
                     x_0 = x_0.repeat_interleave(k, dim=0)
                     x_1 = x_1.repeat_interleave(k, dim=0)
-                t = torch.rand(x_0.shape[0], device=x_0.device)  # sample timestep(s)
-                p_s = self.path.sample(t=t, x_0=x_0, x_1=x_1)  # sample path
-                vt = v_model(p_s.t, p_s.x_t, y=y)
-                return torch.pow(vt - p_s.dx_t, 2).mean()
 
+                # --- Feature-space mixup ---
+                mix_prob = self.cfg.get("mix_prob", 0.4)
+                if mix_prob > 0. and self.bank_feat is not None:
+                    B = x_0.shape[0]
+                    do_mix = torch.rand(B, device=x_0.device) < mix_prob
+                    if do_mix.any():
+                        # sample random same-class partners from the support bank
+                        idx = torch.randint(0, self.bank_feat.shape[0], (B,), device=x_0.device)
+                        partner = self.bank_feat[idx]
+                        partner_x1 = txt_feats[self.bank_labels[idx]]
+                        lam = torch.rand(do_mix.sum(), 1, device=x_0.device)
+                        # slerp on the sphere for image features
+                        x_0[do_mix] = slerp(x_0[do_mix], partner[do_mix], lam)
+                        x_1[do_mix] = slerp(x_1[do_mix], partner_x1[do_mix], lam)
+                # --- end mixup ---
+
+                t = torch.rand(x_0.shape[0], device=x_0.device)
+                p_s = self.path.sample(t=t, x_0=x_0, x_1=x_1)
+                vt = v_model(p_s.t, p_s.x_t, y=y)
+                fm_loss = torch.pow(vt - p_s.dx_t, 2).mean()
+                return fm_loss
+
+                # # THE KEY ADDITION: classification loss on the denoised prediction
+                # # From x_t, take one step to estimate where x_1 would be
+                # # For linear OT path: x_1_hat = x_t + (1 - t) * v(t, x_t)
+                # t_unsq = p_s.t.unsqueeze(-1) if p_s.t.dim() == 1 else p_s.t
+                # x1_hat = F.normalize(p_s.x_t + (1. - t_unsq) * vt, dim=-1)
+
+                # logits = (x1_hat @ txt_feats.t())
+                # cls_loss = F.cross_entropy(logits, labels)
+
+                # return fm_loss + cls_loss
+
+                
             # image -> text loss
             loss = cfm_loss(v_model=self.adapter, x_0=img_feats, x_1=txt_feats[labels], y=ctx)
 
@@ -780,9 +960,9 @@ class FlowAdapter(nn.Module):
 
             return {"ZS": logits_zs, "MT": logits_mt}
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def _solve_ode(
-            self, x0: torch.Tensor, y: torch.Tensor = None, steps: Optional[int] = None, method: str = "dopri5",
+            self, x0: torch.Tensor, y: torch.Tensor = None, steps: Optional[int] = None, method: str = "midpoint",
             t_end: float = 1., net_t: bool = False, reverse: bool = False, use_protos: bool = False,
             return_intermediates=False) -> torch.Tensor:
         """Generate samples via an ODE solver from *torchdiffeq* (if available).
@@ -803,7 +983,8 @@ class FlowAdapter(nn.Module):
         class WrappedModel(ModelWrapper):
             def forward(self, t: torch.Tensor, x: torch.Tensor, **extras):
                 return self.model(x=x, t=t, **extras)
-        net = copy.deepcopy(self.adapter) if not net_t else copy.deepcopy(self.t_adapter)
+        
+        net = self.adapter if not net_t else self.t_adapter
         net = net.eval()
 
         if method == "dopri5":
@@ -820,7 +1001,8 @@ class FlowAdapter(nn.Module):
         else:
             # not an adaptive-step solver
             solver = RiemannianODESolver(velocity_model=WrappedModel(net), manifold=Sphere())  # create an ODESolver class
-            n_steps = int(steps) if steps is not None else 1
+            # solver = ODESolver(velocity_model=WrappedModel(net))  # create an ODESolver class
+            n_steps = int(steps) if steps is not None else 2
             n_steps = max(1, n_steps)
             time_grid = torch.linspace(0.0, float(t_end), n_steps + 1, device=x0.device)
             # For steps=1, using step_size=t_end violates strict interval>step_size checks in solver internals.
@@ -836,8 +1018,8 @@ class FlowAdapter(nn.Module):
 
         return F.normalize(sol, dim=-1)
 
-    @torch.inference_mode()
-    def tune_hyperparameters(self, loader, device, alphas=None, t_end_list=None, solver: str = "dopri5"):
+    @torch.no_grad()
+    def tune_hyperparameters(self, loader, device, alphas=None, t_end_list=None, solver: str = "midpoint"):
         if alphas is None: alphas = np.arange(11) / 10  # 0..1
         if t_end_list is None: t_end_list = np.arange(0, 11) / 10
         best, best_params = -1.0, (0.0, 1.0, 1.0)
@@ -888,7 +1070,7 @@ class MultiLabelFlowAdapter(FlowAdapter):
         # 1. Encode
         img_feats = F.normalize(self.image_encoder(images), dim=-1)
         txt_feats = F.normalize(self.text_encoder().clone().detach(), dim=-1)
-
+        
         # 2. Apply OP
         txt_feats, img_feats = self.OP.transform(x=txt_feats, y=img_feats)
 
@@ -1136,28 +1318,34 @@ class ContrastiveMLPAdapter(FlowAdapter):
 
         hidden_dim = cfg.get("mlp_hidden_dim", out_dim * 2)
 
-        # ada_kwargs = dict(
-        #     in_channels=out_dim, out_channels=out_dim,
-        #     num_res_blocks=cfg["ada_depth"], time_embed_dim=cfg["ada_t_dim"],
-        #     model_channels=cfg["ada_dim"], bottleneck_channels=cfg["ada_dim"],
-        #     use_context=False,
-        #     use_final_layer_head=cfg.get("use_final_layer_head", False),
-        # )
-        # self.adapter = SimpleMLPNoConditioning(**ada_kwargs)
-        self.adapter = nn.Sequential(
-            nn.Linear(img_in_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, out_dim)
-        )
+        if cfg.get("linear_probe", False):
+            self.adapter = nn.Linear(img_in_dim, len(cfg['classnames']))
+            self.t_adapter = None
+        else:
+            if cfg.get("use_residual", False):
+                ada_kwargs = dict(
+                    in_channels=out_dim, out_channels=out_dim,
+                    num_res_blocks=cfg["ada_depth"], time_embed_dim=cfg["ada_t_dim"],
+                    model_channels=cfg["ada_dim"], bottleneck_channels=cfg["ada_dim"],
+                    use_context=False,
+                    use_final_layer_head=cfg.get("use_final_layer_head", False),
+                )
+                self.adapter = SimpleMLPNoConditioning(**ada_kwargs)
+            else:
+                self.adapter = nn.Sequential(
+                    nn.Linear(img_in_dim, hidden_dim),
+                    nn.LayerNorm(hidden_dim),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(hidden_dim, out_dim)
+                )
+            if cfg.get("text_adapter", True):
+                self.t_adapter = nn.Sequential(
+                    nn.Linear(txt_in_dim, hidden_dim),
+                    nn.LayerNorm(hidden_dim),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(hidden_dim, out_dim)
+                )
         print(self.adapter)
-        if cfg.get("text_adapter", True):
-            self.t_adapter = nn.Sequential(
-                nn.Linear(txt_in_dim, hidden_dim),
-                nn.LayerNorm(hidden_dim),
-                nn.ReLU(inplace=True),
-                nn.Linear(hidden_dim, out_dim)
-            )
 
     def forward(self, images: Tensor, labels: Tensor = None, **kwargs):
         img_feats = self.image_encoder(images)
@@ -1173,19 +1361,27 @@ class ContrastiveMLPAdapter(FlowAdapter):
         else:
             logits_zs = None
 
-        img_mt = self.adapter(img_feats)
-        img_mt = F.normalize(img_mt, dim=-1)
-
-        if self.cfg.get("text_adapter", True):
-            txt_mt = self.t_adapter(txt_feats)
-            txt_mt = F.normalize(txt_mt, dim=-1)
+        if self.cfg.get("linear_probe", False):
+            logits_mt = self.adapter(img_feats)
+            logits_zs = logits_mt
         else:
-            txt_mt = txt_feats
+            img_mt = self.adapter(img_feats)
+            img_mt = F.normalize(img_mt, dim=-1)
 
-        logits_mt = self.logit_scale.exp() * img_mt @ txt_mt.T
+            if self.cfg.get("text_adapter", True):
+                txt_mt = self.t_adapter(txt_feats)
+                txt_mt = F.normalize(txt_mt, dim=-1)
+            else:
+                txt_mt = txt_feats
+
+            logits_mt = self.logit_scale.exp() * img_mt @ txt_mt.T
 
         if self.training and labels is not None:
-            loss = F.cross_entropy(logits_mt, labels)
+            if self.cfg.get("dataset") == "VinDrCXR":
+                # Multi-label BCE
+                loss = F.binary_cross_entropy_with_logits(logits_mt, labels.float())
+            else:
+                loss = F.cross_entropy(logits_mt, labels)
             return loss
 
         return {"ZS": logits_zs, "MT": logits_mt}

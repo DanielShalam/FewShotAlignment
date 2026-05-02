@@ -4,7 +4,7 @@ from tqdm import tqdm
 from sklearn.metrics import average_precision_score, roc_auc_score
 
 
-def train_one_epoch(model, loader, optimizer, epoch, device, multi_map=None):
+def train_one_epoch(model, loader, optimizer, epoch, device, multi_map=None, grad_clip=0.0):
     model.train()
     num_batches = len(loader)
     if num_batches == 0:
@@ -30,6 +30,8 @@ def train_one_epoch(model, loader, optimizer, epoch, device, multi_map=None):
 
         optimizer.zero_grad()
         loss.backward()
+        if grad_clip is not None and float(grad_clip) > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(grad_clip), norm_type=2.0)
         optimizer.step()
 
         total_loss += loss.item()
@@ -38,8 +40,8 @@ def train_one_epoch(model, loader, optimizer, epoch, device, multi_map=None):
     return total_loss / num_batches
 
 
-@torch.inference_mode()
-def evaluate(model, loader, device, alpha=0., t_end=0.5):
+@torch.no_grad()
+def evaluate(model, loader, device, alpha=0., t_end=0.5,  solver='midpoint', steps=2):
     model.eval()
     correct = 0
     total = 0
@@ -48,7 +50,7 @@ def evaluate(model, loader, device, alpha=0., t_end=0.5):
         images = batch['img'].to(device)
         labels = batch['label'].to(device)
 
-        out = model(images, t_end=t_end, solver='dopri5')  # Returns dict {'ZS': ..., 'MT': ...}
+        out = model(images, t_end=t_end, solver=solver, steps=steps)  # Returns dict {'ZS': ..., 'MT': ...}
 
         # Ensemble logits
         logits = (1 - alpha) * out['MT'] + alpha * out['ZS']
@@ -60,8 +62,8 @@ def evaluate(model, loader, device, alpha=0., t_end=0.5):
     return 100. * correct / total
 
 
-@torch.inference_mode()
-def evaluate_multilabel(model, loader, multi_map, device, alpha=0., t_end=0.5, solver="dopri5"):
+@torch.no_grad()
+def evaluate_multilabel(model, loader, multi_map, device, alpha=0., t_end=0.8, solver="midpoint"):
     model.eval()
 
     scores, targets = [], []
@@ -75,8 +77,8 @@ def evaluate_multilabel(model, loader, multi_map, device, alpha=0., t_end=0.5, s
         scores.append(S.cpu().numpy())
         targets.append(y.cpu().numpy())
 
-    S = np.concatenate(scores, 0)
-    Y = np.concatenate(targets, 0)
+    S = np.concatenate(scores, 0)[:, :7]
+    Y = np.concatenate(targets, 0)[:, :7]
 
     per_ap, per_roc = [], []
     for c in range(Y.shape[1]):
@@ -96,7 +98,7 @@ def evaluate_multilabel(model, loader, multi_map, device, alpha=0., t_end=0.5, s
         "macro_AUROC": macro_auc
     }
 
-@torch.inference_mode()
+@torch.no_grad()
 def evaluate_mlp(model, loader, device, alpha=0., **kwargs):
     model.eval()
     correct = 0
@@ -119,3 +121,44 @@ def evaluate_mlp(model, loader, device, alpha=0., **kwargs):
         total += labels.size(0)
 
     return 100. * correct / total
+
+@torch.no_grad()
+def evaluate_mlp_multilabel(model, loader, multi_map, device, alpha=0., **kwargs):
+    model.eval()
+
+    scores, targets = [], []
+    for batch in tqdm(loader, desc="Eval", leave=False):
+        x = batch["img"].to(device)
+        impaths = batch["impath"]
+        y = torch.stack([multi_map[p] for p in impaths], 0).to(device)
+
+        out = model(x)
+        
+        if getattr(model, "OP", None) is not None and model.OP.enable:
+            S = (1 - alpha) * out["MT"] + alpha * out["ZS"]
+        else:
+            S = out["MT"]
+
+        scores.append(S.sigmoid().cpu().numpy())
+        targets.append(y.cpu().numpy())
+
+    S = np.concatenate(scores, 0)[:, :7]
+    Y = np.concatenate(targets, 0)[:, :7]
+    
+    per_ap, per_roc = [], []
+    for c in range(Y.shape[1]):
+        if Y[:, c].sum() < 1:
+            per_ap.append(np.nan); per_roc.append(np.nan); continue
+        per_ap.append(average_precision_score(Y[:, c], S[:, c]))
+        try:
+            per_roc.append(roc_auc_score(Y[:, c], S[:, c]))
+        except ValueError:
+            per_roc.append(np.nan)
+
+    macro_ap  = float(np.nanmean(per_ap))
+    macro_auc = float(np.nanmean(per_roc))
+    return {
+        "per_class_AP": per_ap,
+        "macro_AUPRC": macro_ap,
+        "macro_AUROC": macro_auc
+    }
