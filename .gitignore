@@ -29,3 +29,8 @@ env/
 # IDE metadata
 .idea/
 .vscode/
+
+# Large biomedical feature caches (not pushed to GitHub)
+data/pmc_oa/
+data/deeploc/*.pt
+data/deeploc/*.log

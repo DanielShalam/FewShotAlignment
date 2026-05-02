@@ -4,7 +4,7 @@ from tqdm import tqdm
 from sklearn.metrics import average_precision_score, roc_auc_score
 
 
-def train_one_epoch(model, loader, optimizer, epoch, device, multi_map=None):
+def train_one_epoch(model, loader, optimizer, epoch, device, multi_map=None, after_step=None):
     model.train()
     num_batches = len(loader)
     if num_batches == 0:
@@ -31,6 +31,8 @@ def train_one_epoch(model, loader, optimizer, epoch, device, multi_map=None):
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        if after_step is not None:
+            after_step()
 
         total_loss += loss.item()
         pbar.set_postfix({'loss': loss.item()})
@@ -39,7 +41,7 @@ def train_one_epoch(model, loader, optimizer, epoch, device, multi_map=None):
 
 
 @torch.inference_mode()
-def evaluate(model, loader, device, alpha=0., t_end=0.5):
+def evaluate(model, loader, device, alpha=0., t_end=0.5, solver='dopri5', steps=None):
     model.eval()
     correct = 0
     total = 0
@@ -48,7 +50,7 @@ def evaluate(model, loader, device, alpha=0., t_end=0.5):
         images = batch['img'].to(device)
         labels = batch['label'].to(device)
 
-        out = model(images, t_end=t_end, solver='dopri5')  # Returns dict {'ZS': ..., 'MT': ...}
+        out = model(images, t_end=t_end, solver=solver, steps=steps)  # Returns dict {'ZS': ..., 'MT': ...}
 
         # Ensemble logits
         logits = (1 - alpha) * out['MT'] + alpha * out['ZS']

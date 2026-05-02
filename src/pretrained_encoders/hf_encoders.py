@@ -45,9 +45,9 @@ def make_transforms_hf(model_name: str, rrc_scale: Tuple[float,float]=(0.5, 1.0)
     mean = getattr(proc, "image_mean", (0.485, 0.456, 0.406))
     std  = getattr(proc, "image_std",  (0.229, 0.224, 0.225))
 
-    # Mild augmentation, but preserve HF normalization + geometry
+    # Mild augmentation, but preserve HF normalization + geometry (matches eval resolution)
     train_tfm = T.Compose([
-        T.RandomResizedCrop(size=224, scale=rrc_scale, interpolation=T.InterpolationMode.BICUBIC),
+        T.RandomResizedCrop(size=crop, scale=rrc_scale, interpolation=T.InterpolationMode.BICUBIC),
         T.RandomHorizontalFlip(p=hflip_p),
         T.ToTensor(),
         T.Normalize(mean=mean, std=std),
@@ -93,6 +93,11 @@ class HFTextEncoder(nn.Module):
 
     def encode_text(self, tokenizer_out, normalize=False):
         device = torch.device("cuda")
+        # Ensure tokenizer tensors live on the same device as the model
+        if hasattr(tokenizer_out, 'to'):
+            tokenizer_out = tokenizer_out.to(self.device)
+        elif isinstance(tokenizer_out, dict):
+            tokenizer_out = {k: (v.to(self.device) if hasattr(v, 'to') else v) for k, v in tokenizer_out.items()}
         if self.tokenizer is None:
             text_features = self.txt_model.encode(tokenizer_out)
             text_features = torch.from_numpy(text_features).float().to(device)

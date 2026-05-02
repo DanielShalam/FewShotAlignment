@@ -57,10 +57,10 @@ def main():
     cfg["classnames"] = dataset.classnames
 
     # Model
-    if cfg["dataset"] != "VinDrCXR":
-        model = FlowAdapter(cfg).to(device)
+    if cfg["dataset"] in ("VinDrCXR", "DeepLoc2"):
+        model = MultiLabelFlowAdapter(cfg).to(device)
     else:
-        model = MultiLabelFlowAdapter(cfg).to(device)   # multi-label loss and tuning
+        model = FlowAdapter(cfg).to(device)   # multi-label loss and tuning
 
     # Data
     logger.info(f"Building {cfg['dataset']} dataloaders...")
@@ -94,31 +94,87 @@ def main():
         else list(model.adapter.parameters()) + list(model.t_adapter.parameters())
     optimizer = torch.optim.AdamW(params, lr=cfg['lr'], weight_decay=cfg['wd'])
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg['epochs'])
-    
-    best_acc = 0.0
+
+    import copy
+    # --- EMA shadow params (optional; cfg.ema_decay<=0 disables) ---
+    ema_decay = float(cfg.get('ema_decay', 0.0))
+    ema_modules = [model.adapter] + ([model.t_adapter] if cfg['text_adapter'] else [])
+    ema_shadow = None
+    _ema_update = None
+    _ema_swap = None
+    _ema_restore = None
+    if ema_decay > 0.0:
+        ema_shadow = [{n: p.detach().clone() for n, p in m.named_parameters()} for m in ema_modules]
+        @torch.no_grad()
+        def _ema_update():
+            for m, shadow in zip(ema_modules, ema_shadow):
+                for n, p in m.named_parameters():
+                    shadow[n].mul_(ema_decay).add_(p.detach(), alpha=1.0 - ema_decay)
+        def _ema_swap():
+            # swap module params with shadow; return backup for restoration
+            backups = []
+            for m, shadow in zip(ema_modules, ema_shadow):
+                b = {}
+                for n, p in m.named_parameters():
+                    b[n] = p.detach().clone()
+                    p.data.copy_(shadow[n])
+                backups.append(b)
+            return backups
+        def _ema_restore(backups):
+            for m, b in zip(ema_modules, backups):
+                for n, p in m.named_parameters():
+                    p.data.copy_(b[n])
+    best_val = -1.0
+    best_state = None
     eval_freq = cfg.get('eval_freq', cfg['epochs']) # Default to only evaluating at the end if not specified
-    train_multi_map = dataset.multi_map if cfg['dataset'] == "VinDrCXR" else None
+    train_multi_map = dataset.multi_map if cfg['dataset'] in ('VinDrCXR', 'DeepLoc2') else None
     for epoch in range(1, cfg['epochs'] + 1):
-        loss = train_one_epoch(model, train_loader, optimizer, epoch, device, multi_map=train_multi_map)
+        loss = train_one_epoch(model, train_loader, optimizer, epoch, device, multi_map=train_multi_map,
+                               after_step=_ema_update)
         if scheduler is not None:
             scheduler.step()
-        
+
         if epoch % eval_freq == 0:
-            print(f"--- Fast Evaluation at Epoch {epoch} ---")
-            if cfg['dataset'] != "VinDrCXR":
-                acc = evaluate(model, test_loader, device, alpha=cfg['alpha'])
-                print(f"Test Accuracy: {acc:.2f}%")
-                if acc > best_acc:
-                    best_acc = acc
-                    # Save best model logic can go here if needed.
+            print(f"--- Eval at Epoch {epoch} ---")
+            _bk = _ema_swap() if _ema_swap is not None else None
+            if cfg['dataset'] not in ('VinDrCXR', 'DeepLoc2'):
+                # Validation-driven best checkpoint selection (no test leakage)
+                t_ends = cfg.get('fast_eval_t_ends', [0.5, 1.0])
+                if val_loader is not None:
+                    val_accs = [evaluate(model, val_loader, device, alpha=cfg['alpha'], t_end=te,
+                                         solver=cfg.get('fast_eval_solver', 'dopri5'),
+                                         steps=cfg.get('fast_eval_steps', None)) for te in t_ends]
+                    best_te_idx = max(range(len(t_ends)), key=lambda i: val_accs[i])
+                    val_acc = val_accs[best_te_idx]
+                    print("Val Accuracy: " + "  ".join(f"τ={te:.2f}:{a:.2f}" for te,a in zip(t_ends, val_accs)) + f"  -> best τ={t_ends[best_te_idx]:.2f} acc={val_acc:.2f}%")
+                    if val_acc > best_val:
+                        best_val = val_acc
+                        best_state = {
+                            'adapter': copy.deepcopy(model.adapter.state_dict()),
+                            't_adapter': copy.deepcopy(model.t_adapter.state_dict()) if cfg['text_adapter'] else None,
+                        }
+                # Optional monitoring on test (not used for selection)
+                test_accs = [evaluate(model, test_loader, device, alpha=cfg['alpha'], t_end=te,
+                                      solver=cfg.get('fast_eval_solver', 'dopri5'),
+                                      steps=cfg.get('fast_eval_steps', None)) for te in t_ends]
+                print("Test Accuracy: " + "  ".join(f"τ={te:.2f}:{a:.2f}" for te,a in zip(t_ends, test_accs)))
             else:
                 acc = evaluate_multilabel(model, test_loader, dataset.multi_map, device, alpha=cfg['alpha'])
                 print(f"Test Result: {acc}")
+            if _bk is not None:
+                _ema_restore(_bk)
+
+    # Restore best-val checkpoint before final eval/tune
+    if best_state is not None:
+        model.adapter.load_state_dict(best_state['adapter'])
+        if cfg['text_adapter'] and best_state.get('t_adapter') is not None:
+            model.t_adapter.load_state_dict(best_state['t_adapter'])
+        print(f"Loaded best-val checkpoint (val acc = {best_val:.2f}%)")
 
     # Save Config and OP automatically
     save_checkpoint(model, optimizer, scheduler, cfg, epoch, args.output_dir, is_best=True)
 
-    if cfg['dataset'] != "VinDrCXR":
+    if cfg['dataset'] not in ('VinDrCXR', 'DeepLoc2'):
         acc = evaluate(model, test_loader, device, alpha=cfg['alpha'])
         print(f"Test Accuracy (Before tuning): {acc:.2f}%")
 

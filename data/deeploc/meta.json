@@ -1,0 +1,37 @@
+{
+  "dataset": "AI4Protein/DeepLoc2Multi",
+  "classes": [
+    "Nucleus",
+    "Cytoplasm",
+    "Extracellular",
+    "Mitochondrion",
+    "Cell membrane",
+    "Endoplasmic reticulum",
+    "Plastid",
+    "Golgi apparatus",
+    "Lysosome / Vacuole",
+    "Peroxisome"
+  ],
+  "class_prompts": [
+    "Nucleus: the organelle containing the cell's chromosomal DNA and the site of transcription.",
+    "Cytoplasm: the aqueous interior of the cell excluding the nucleus and membrane-bound organelles.",
+    "Extracellular: secreted or located outside the cell, including the extracellular matrix.",
+    "Mitochondrion: the organelle that carries out oxidative phosphorylation and ATP production.",
+    "Cell membrane: the plasma membrane bilayer enclosing the cell.",
+    "Endoplasmic reticulum: the membrane network for protein folding and lipid synthesis.",
+    "Plastid: a plant-cell organelle such as a chloroplast that performs photosynthesis or storage.",
+    "Golgi apparatus: the organelle that modifies, sorts and packages proteins for secretion.",
+    "Lysosome or vacuole: the acidic organelle for degradation and storage.",
+    "Peroxisome: the organelle for fatty-acid oxidation and hydrogen-peroxide metabolism."
+  ],
+  "num_classes": 10,
+  "esm_model": "facebook/esm2_t30_150M_UR50D",
+  "text_models": [
+    "Qwen/Qwen3-Embedding-8B"
+  ],
+  "counts": {
+    "train": 21948,
+    "validation": 2744,
+    "test": 2744
+  }
+}

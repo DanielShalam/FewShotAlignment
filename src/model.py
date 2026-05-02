@@ -55,6 +55,17 @@ CUSTOM_TEMPLATES = {
     'ImageNetR': 'a photo of a {}.',
     'ChestX14': 'a chest X-ray showing {}.',
     'VinDrCXR': 'a chest X-ray showing {}.',
+    'BUSI': 'a biomedical image of {}.',
+    'KneeXray': 'a biomedical image of {}.',
+    'CHMNIST': 'a biomedical image of {}.',
+    'BTMRI': 'a biomedical image of {}.',
+    'COVID_19': 'a biomedical image of {}.',
+    'CTKidney': 'a biomedical image of {}.',
+    'DermaMNIST': 'a biomedical image of {}.',
+    'Kvasir': 'a biomedical image of {}.',
+    'LungColon': 'a biomedical image of {}.',
+    'OCTMNIST': 'a biomedical image of {}.',
+    'RETINA': 'a biomedical image of {}.',
 }
 
 ## Helpers
@@ -161,6 +172,20 @@ def generalized_orthogonal_procrustes(T, P, labels, *, eps=1e-6):
     W /= num_shot
     return W # [Dt,Di]
 @torch.no_grad()
+def ridge_procrustes(T, P, labels, *, lam=1e-2, eps=1e-6):
+    """
+    Non-orthogonal ridge-regularized linear fit:
+        min_W ||T W - P||_F^2 + lam * ||W||_F^2
+    Closed form: W = (T^T T + lam I)^{-1} T^T P.
+    T:[C,Dt], P:[C,Di]  ->  W:[Dt,Di]
+    """
+    Dt = T.shape[1]
+    A = (T.T @ T).float()
+    B = (T.T @ P).float()
+    I = torch.eye(Dt, device=A.device, dtype=A.dtype)
+    W = torch.linalg.solve(A + lam * I, B)
+    return W
+
 def orthogonal_procrustes(T, P, labels, *, r=None, eps=1e-6):
     """
     Solve:   min_W || T W - P ||_F
@@ -508,14 +533,20 @@ class ProjectToTangent(torch.nn.Module):
 
 # OP
 class OrthogonalProcrustes(nn.Module):
-    def __init__(self, enable: bool, mode: str, zero_padding: bool, pretrained: str = None):
+    def __init__(self, enable: bool, mode: str, zero_padding: bool, pretrained: str = None, ridge_lambda: float = 1e-2):
         super().__init__()
-        assert mode in ["centroid", "generalized"], f"mode must be 'centroid' or 'generalized', got {mode}"
+        assert mode in ["centroid", "generalized", "ridge"], f"mode must be centroid|generalized|ridge, got {mode}"
         self.enable = enable
         self.mode = mode
         self.zero_padding = zero_padding
 
-        self._compute_procrustes = orthogonal_procrustes if mode == "centroid" else generalized_orthogonal_procrustes
+        self.ridge_lambda = ridge_lambda
+        if mode == "centroid":
+            self._compute_procrustes = orthogonal_procrustes
+        elif mode == "generalized":
+            self._compute_procrustes = generalized_orthogonal_procrustes
+        else:
+            self._compute_procrustes = lambda T, P, labels: ridge_procrustes(T, P, labels, lam=ridge_lambda)
         self.W = None
         if pretrained is not None and pretrained != "":
             print("[OP] Loading pretrained W...")
@@ -574,14 +605,23 @@ class FlowAdapter(nn.Module):
         self.bank_feat = None; self.bank_labels = None; self.bank_prototypes = None
 
         # 1. Load Uni-Modal Encoders (Frozen)
-        text_encoder, self.image_encoder, self.train_tfm, self.eval_tfm = self._build_pretrained_encoders()
-        self.text_encoder = TextEncoder(cfg, cfg["classnames"], text_encoder)
-        self.logit_scale = text_encoder.logit_scale if hasattr(text_encoder, 'logit_scale') else torch.tensor(0.)
+        if cfg.get("txt_src") == "FEAT" and cfg.get("img_src") == "FEAT":
+            from src.pretrained_encoders.feature_cache import IdentityImageEncoder, CachedTextEncoder
+            tf = torch.load(cfg["text_features_path"], weights_only=False).float()
+            self.text_encoder = CachedTextEncoder(tf)
+            self.image_encoder = IdentityImageEncoder(dim=int(cfg["img_dim"]))
+            self.train_tfm, self.eval_tfm = None, None
+            self.logit_scale = torch.tensor(0.)
+        else:
+            text_encoder, self.image_encoder, self.train_tfm, self.eval_tfm = self._build_pretrained_encoders()
+            self.text_encoder = TextEncoder(cfg, cfg["classnames"], text_encoder)
+            self.logit_scale = text_encoder.logit_scale if hasattr(text_encoder, 'logit_scale') else torch.tensor(0.)
 
         # 2. Initialize Orthogonal Procrustes
         zero_padding = False
         self.OP = OrthogonalProcrustes(
-            enable=cfg["use_op"], mode="centroid", zero_padding=zero_padding, pretrained=cfg["pretrained_op"],
+            enable=cfg["use_op"], mode=cfg.get("op_mode", "centroid"), zero_padding=zero_padding,
+            pretrained=cfg["pretrained_op"], ridge_lambda=cfg.get("op_ridge_lambda", 1e-2),
         )
 
         # 3. Create Adapters
@@ -639,12 +679,15 @@ class FlowAdapter(nn.Module):
             text_encoder = HFTextEncoder(text_model)
         elif text_source == "OC":               # open-clip
             print(f'-> Loading Open-Clip Text encoder... ({text_model})')
-            try:
-                text_encoder, train_tfm, eval_tfm = open_clip.create_model_and_transforms(
-                    text_model, pretrained='laion2b_s32b_b82k')
-            except:
-                text_encoder, train_tfm, eval_tfm = open_clip.create_model_and_transforms(
-                    text_model, pretrained='openai', force_quick_gelu=True)
+            if text_model.startswith('hf-hub:'):
+                text_encoder, train_tfm, eval_tfm = open_clip.create_model_and_transforms(text_model)
+            else:
+                try:
+                    text_encoder, train_tfm, eval_tfm = open_clip.create_model_and_transforms(
+                        text_model, pretrained='laion2b_s32b_b82k')
+                except:
+                    text_encoder, train_tfm, eval_tfm = open_clip.create_model_and_transforms(
+                        text_model, pretrained='openai', force_quick_gelu=True)
         else:                                   # OpenAI-clip
             print(f'-> Loading Clip Text encoder... ({text_model})')
             text_encoder = load_clip_to_cpu(text_model)
@@ -661,12 +704,15 @@ class FlowAdapter(nn.Module):
         else:
             if img_source == "OC":    # open-clip
                 print(f'-> Loading Open-Clip  (Visual) as image encoder... ({img_model})')
-                try:
-                    temp_, train_tfm, eval_tfm = open_clip.create_model_and_transforms(
-                        img_model, pretrained='laion2b_s32b_b82k')
-                except:
-                    temp_, train_tfm, eval_tfm = open_clip.create_model_and_transforms(
-                        img_model, pretrained='openai', force_quick_gelu=True)
+                if img_model.startswith('hf-hub:'):
+                    temp_, train_tfm, eval_tfm = open_clip.create_model_and_transforms(img_model)
+                else:
+                    try:
+                        temp_, train_tfm, eval_tfm = open_clip.create_model_and_transforms(
+                            img_model, pretrained='laion2b_s32b_b82k')
+                    except:
+                        temp_, train_tfm, eval_tfm = open_clip.create_model_and_transforms(
+                            img_model, pretrained='openai', force_quick_gelu=True)
             else:                                   # clip
                 print(f'-> Loading Clip  (Visual) as image encoder... ({img_model})')
                 temp_, preprocess = clip.load(img_model, jit=False)
@@ -679,10 +725,15 @@ class FlowAdapter(nn.Module):
                 eval_tfm = preprocess
 
             image_encoder = temp_.visual
-            if isinstance(temp_.text_projection, torch.nn.Parameter):
-                image_encoder.dim = temp_.text_projection.shape[-1]
-            else:
-                image_encoder.dim = temp_.text_projection.weight.shape[-1]
+            try:
+                if isinstance(temp_.text_projection, torch.nn.Parameter):
+                    image_encoder.dim = temp_.text_projection.shape[-1]
+                else:
+                    image_encoder.dim = temp_.text_projection.weight.shape[-1]
+            except AttributeError:
+                # e.g. BiomedCLIP CustomTextCLIP: infer dim by a dummy forward
+                with torch.no_grad():
+                    image_encoder.dim = int(temp_.encode_image(torch.zeros(1,3,224,224)).shape[-1])
 
         text_encoder = text_encoder.eval().float()
         image_encoder = image_encoder.eval().float()
@@ -744,12 +795,24 @@ class FlowAdapter(nn.Module):
                 vt = v_model(p_s.t, p_s.x_t, y=y)
                 return torch.pow(vt - p_s.dx_t, 2).mean()
 
+            x_img = img_feats
+            x_txt = txt_feats[labels]
+
+            # SLERP mixup (shared lambda, shared permutation)
+            mix_alpha = self.cfg.get("mixup_alpha", 0.0)
+            if mix_alpha > 0:
+                B = x_img.size(0)
+                perm = torch.randperm(B, device=x_img.device)
+                lam = torch.distributions.Beta(mix_alpha, mix_alpha).sample((B, 1)).to(x_img.device)
+                x_img = slerp(x_img, x_img[perm], lam)
+                x_txt = slerp(x_txt, x_txt[perm], lam)
+
             # image -> text loss
-            loss = cfm_loss(v_model=self.adapter, x_0=img_feats, x_1=txt_feats[labels], y=ctx)
+            loss = cfm_loss(v_model=self.adapter, x_0=x_img, x_1=x_txt, y=ctx)
 
             # (optional) text -> image loss
             if self.cfg["text_adapter"]:
-                loss += cfm_loss(v_model=self.t_adapter, x_0=txt_feats[labels], x_1=img_feats, y=ctx)
+                loss += cfm_loss(v_model=self.t_adapter, x_0=x_txt, x_1=x_img, y=ctx)
 
             return loss
 
@@ -940,7 +1003,7 @@ class MultiLabelFlowAdapter(FlowAdapter):
     @torch.inference_mode()
     def tune_hyperparameters(self, loader, multi_map, device, alphas=None, t_end_list=None, solver: str = "dopri5"):
         if alphas is None: alphas = np.linspace(0.0, 1.0, 11)  # 0..1
-        if t_end_list is None: t_end_list = np.linspace(0., 1., 11)
+        if t_end_list is None: t_end_list = np.linspace(0., 1., int(self.cfg.get('tune_t_steps', 11)))
         best, best_pair = -1.0, (0.5, 0.6)
         self.eval()
         for t_end in t_end_list:

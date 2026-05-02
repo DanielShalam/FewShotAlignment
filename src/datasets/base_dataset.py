@@ -15,6 +15,9 @@ from src.utils import Registry
 
 DATASET_REGISTRY = Registry("DATASET")
 
+# Registry for precomputed-feature datasets: impath -> tensor
+FEATURE_REGISTRY: dict = {}
+
 
 def build_dataset(cfg):
     avai_datasets = DATASET_REGISTRY.registered_names()
@@ -28,7 +31,7 @@ def build_loaders(cfg, dataset, train_tfm, eval_tfm, return_train_eval=False):
     train_loader = torch.utils.data.DataLoader(
         DatasetWrapper(cfg, dataset.train_x, transform=train_tfm, is_train=True),
         batch_size=cfg["batch_size"], num_workers=cfg["num_workers"],
-        drop_last=train_drop_last, pin_memory=True,
+        drop_last=train_drop_last, pin_memory=True, shuffle=True,
     )
     # Build val_loader
     val_loader = None
@@ -87,6 +90,11 @@ class DatasetWrapper(TorchDataset):
             "impath": item.impath,
             "index": idx
         }
+
+        # Precomputed-feature bypass
+        if isinstance(item.impath, str) and item.impath.startswith("feat://"):
+            output["img"] = FEATURE_REGISTRY[item.impath]
+            return output
 
         img0 = read_image(item.impath)
 

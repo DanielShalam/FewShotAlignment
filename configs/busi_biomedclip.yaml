@@ -1,0 +1,31 @@
+dataset: "BUSI"
+root: "/efs/user_folders/dnshalam/datasets/biomedcoop"
+shots: 16
+seed: 42
+
+# Training
+epochs: 300
+lr: 0.00001
+wd: 0.00001
+batch_size: 32
+eval_freq: 25
+num_workers: 4
+
+# Model / Flow
+fm_type: "geodesic"
+inv_fm_type: "adapter"
+use_op: False       # multi-modal co-trained: no OP (as per main paper ablation)
+pretrained_op: ""
+text_adapter: True
+ada_depth: 4
+ada_dim: 1536
+ada_t_dim: 256
+train_time_samples: 1
+alpha: 0.0
+use_context: False
+
+# Encoders: BiomedCLIP both towers
+txt_src: "OC"
+txt_model: "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
+img_src: "OC"
+img_model: "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"

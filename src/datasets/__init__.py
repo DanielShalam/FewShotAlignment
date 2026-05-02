@@ -14,3 +14,5 @@ import src.datasets.imagenet_sketch
 import src.datasets.imagenetv2
 import src.datasets.imagenet_a
 import src.datasets.imagenet_r
+import src.datasets.deeploc2
+import src.datasets.biomedcoop
