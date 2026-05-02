@@ -103,13 +103,17 @@ def slerp(u: torch.Tensor, v: torch.Tensor, lam: torch.Tensor, eps: float = 1e-7
 
     return F.normalize(out, p=2, dim=-1)
 @torch.inference_mode()
-def make_support_bank(visual, support_loader):
+def make_support_bank(visual, support_loader, multi_map=None):
     visual.eval()
     feats, labels = [], []
     for b in support_loader:
         f = F.normalize(visual(b['img'].cuda()), dim=-1)
         feats.append(f.cpu())
-        labels.append(b['label'])
+        if multi_map is not None:
+            impaths = b["impath"]
+            labels.append(torch.stack([multi_map[p] for p in impaths], 0))
+        else:
+            labels.append(b['label'])
     return torch.cat(feats).cuda(), torch.cat(labels).cuda()  # [Ns,D], [Ns]
 @torch.no_grad()
 def build_class_prototypes(feats, labels, num_classes):
@@ -120,7 +124,10 @@ def build_class_prototypes(feats, labels, num_classes):
     protos = torch.zeros(num_classes, D, device=feats.device, dtype=feats.dtype)
     counts = torch.zeros(num_classes, device=feats.device, dtype=feats.dtype)
     for c in range(num_classes):
-        mask = (labels == c)
+        if labels.dim() > 1:
+            mask = (labels[:, c] > 0)
+        else:
+            mask = (labels == c)
         if mask.any():
             protos[c] = feats[mask].mean(dim=0)
             counts[c] = mask.float().sum()
@@ -731,7 +738,7 @@ class FlowAdapter(nn.Module):
 
         # T2I adapter (optional)
         if cfg["text_adapter"]:
-            self.t_adapter = SimpleMLP(**ada_kwargs)    # text to image adapter
+            self.t_adapter = SphereMLP(**ada_kwargs)    # text to image adapter
 
         # 4. Flow Matching Setup
         if cfg["fm_type"] == "geodesic":
@@ -819,14 +826,14 @@ class FlowAdapter(nn.Module):
         return text_encoder, image_encoder, train_tfm, eval_tfm
 
     @torch.inference_mode()
-    def create_bank(self, loader, op_beta=None):
+    def create_bank(self, loader, op_beta=None, multi_map=None):
         """
         support_items: the EXACT k-shot training items (per class) you will train on.
                        (No val items here to keep protocol clean.)
         """
 
         # compute support features in the SAME space you'll use at train/eval
-        self.bank_feat, self.bank_labels = make_support_bank(visual=self.image_encoder, support_loader=loader)
+        self.bank_feat, self.bank_labels = make_support_bank(visual=self.image_encoder, support_loader=loader, multi_map=multi_map)
 
         #  class prototypes (image space)
         num_classes = self.text_encoder.text_features.size(0)
@@ -1311,30 +1318,34 @@ class ContrastiveMLPAdapter(FlowAdapter):
 
         hidden_dim = cfg.get("mlp_hidden_dim", out_dim * 2)
 
-        if cfg.get("use_residual", False):
-            ada_kwargs = dict(
-                in_channels=out_dim, out_channels=out_dim,
-                num_res_blocks=cfg["ada_depth"], time_embed_dim=cfg["ada_t_dim"],
-                model_channels=cfg["ada_dim"], bottleneck_channels=cfg["ada_dim"],
-                use_context=False,
-                use_final_layer_head=cfg.get("use_final_layer_head", False),
-            )
-            self.adapter = SimpleMLPNoConditioning(**ada_kwargs)
+        if cfg.get("linear_probe", False):
+            self.adapter = nn.Linear(img_in_dim, len(cfg['classnames']))
+            self.t_adapter = None
         else:
-            self.adapter = nn.Sequential(
-                nn.Linear(img_in_dim, hidden_dim),
-                nn.LayerNorm(hidden_dim),
-                nn.ReLU(inplace=True),
-                nn.Linear(hidden_dim, out_dim)
-            )
+            if cfg.get("use_residual", False):
+                ada_kwargs = dict(
+                    in_channels=out_dim, out_channels=out_dim,
+                    num_res_blocks=cfg["ada_depth"], time_embed_dim=cfg["ada_t_dim"],
+                    model_channels=cfg["ada_dim"], bottleneck_channels=cfg["ada_dim"],
+                    use_context=False,
+                    use_final_layer_head=cfg.get("use_final_layer_head", False),
+                )
+                self.adapter = SimpleMLPNoConditioning(**ada_kwargs)
+            else:
+                self.adapter = nn.Sequential(
+                    nn.Linear(img_in_dim, hidden_dim),
+                    nn.LayerNorm(hidden_dim),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(hidden_dim, out_dim)
+                )
+            if cfg.get("text_adapter", True):
+                self.t_adapter = nn.Sequential(
+                    nn.Linear(txt_in_dim, hidden_dim),
+                    nn.LayerNorm(hidden_dim),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(hidden_dim, out_dim)
+                )
         print(self.adapter)
-        if cfg.get("text_adapter", True):
-            self.t_adapter = nn.Sequential(
-                nn.Linear(txt_in_dim, hidden_dim),
-                nn.LayerNorm(hidden_dim),
-                nn.ReLU(inplace=True),
-                nn.Linear(hidden_dim, out_dim)
-            )
 
     def forward(self, images: Tensor, labels: Tensor = None, **kwargs):
         img_feats = self.image_encoder(images)
@@ -1350,19 +1361,27 @@ class ContrastiveMLPAdapter(FlowAdapter):
         else:
             logits_zs = None
 
-        img_mt = self.adapter(img_feats)
-        img_mt = F.normalize(img_mt, dim=-1)
-
-        if self.cfg.get("text_adapter", True):
-            txt_mt = self.t_adapter(txt_feats)
-            txt_mt = F.normalize(txt_mt, dim=-1)
+        if self.cfg.get("linear_probe", False):
+            logits_mt = self.adapter(img_feats)
+            logits_zs = logits_mt
         else:
-            txt_mt = txt_feats
+            img_mt = self.adapter(img_feats)
+            img_mt = F.normalize(img_mt, dim=-1)
 
-        logits_mt = self.logit_scale.exp() * img_mt @ txt_mt.T
+            if self.cfg.get("text_adapter", True):
+                txt_mt = self.t_adapter(txt_feats)
+                txt_mt = F.normalize(txt_mt, dim=-1)
+            else:
+                txt_mt = txt_feats
+
+            logits_mt = self.logit_scale.exp() * img_mt @ txt_mt.T
 
         if self.training and labels is not None:
-            loss = F.cross_entropy(logits_mt, labels)
+            if self.cfg.get("dataset") == "VinDrCXR":
+                # Multi-label BCE
+                loss = F.binary_cross_entropy_with_logits(logits_mt, labels.float())
+            else:
+                loss = F.cross_entropy(logits_mt, labels)
             return loss
 
         return {"ZS": logits_zs, "MT": logits_mt}

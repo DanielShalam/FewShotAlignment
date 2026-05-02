@@ -168,10 +168,10 @@ class ChestX14(DatasetBase):
                     freq[l] += 1
 
         # options
-        opt = getattr(cfg.DATASET, "CHESTX", None)
-        primary_strategy = (getattr(opt, "PRIMARY_STRATEGY", "rare") if opt is not None else "rare")
-        ignore_no_finding = (getattr(opt, "IGNORE_NO_FINDING_IN_MIXED", True) if opt is not None else True)
-        val_per_class = int(getattr(opt, "VAL_SIZE_PER_CLASS", 4) if opt is not None else 4)
+        opt = cfg.get("CHESTX", None)
+        primary_strategy = cfg.get("PRIMARY_STRATEGY", "rare")
+        ignore_no_finding = cfg.get("IGNORE_NO_FINDING_IN_MIXED", True)
+        val_per_class = cfg.get("VAL_SIZE_PER_CLASS", 4)
 
         # filter names by assigning primary labels
         primaries = {}

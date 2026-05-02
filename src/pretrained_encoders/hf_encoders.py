@@ -69,7 +69,7 @@ class HFTextEncoder(nn.Module):
     and extract features for different modalities.
     """
 
-    def __init__(self, txt_model: str, device: torch.device = torch.device("cuda")):
+    def __init__(self, txt_model: str, device: torch.device = torch.device("cpu")):
         super().__init__()
         self.device = device
         self.txt_model_name = txt_model

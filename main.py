@@ -1,3 +1,4 @@
+import json
 import argparse
 import os
 from pathlib import Path
@@ -9,6 +10,10 @@ from src.utils import setup_logger, set_seed, save_checkpoint, load_checkpoint
 from src.datasets.base_dataset import build_dataset, build_loaders, DatasetWrapper
 from src.model import FlowAdapter, MultiLabelFlowAdapter, GuidedVelocity
 from src.engine import train_one_epoch, evaluate, evaluate_multilabel
+
+def save_results(output_dir, metrics):
+    with open(os.path.join(output_dir, "results.json"), "w") as f:
+        json.dump(metrics, f, indent=4)
 
 """
 OOD:
@@ -113,7 +118,6 @@ def main():
             pin_memory=True,
         )
         
-        
     logger.info(
         f"Loader sizes: train_batches={len(train_loader)}, train_eval_batches={len(train_val_loader)}, "
         f"val_batches={len(val_loader) if val_loader is not None else 0}, test_batches={len(test_loader)}"
@@ -126,7 +130,8 @@ def main():
         # Note: load_checkpoint loads state_dict, which includes OP.W
     else:
         # Create support bank (Proto calculation + OP fitting)
-        model.create_bank(train_val_loader)
+        multi_map = getattr(dataset, "multi_map", None)
+        model.create_bank(train_val_loader, multi_map=multi_map)
 
     # Eval Only Mode
     if args.eval_only:
@@ -154,6 +159,13 @@ def main():
         acc_tuned = evaluate(model, test_loader, device, alpha=best_params[0], t_end=best_params[1])
         print(f"Best Hyparparams: alpha={best_params[0]}, timestep={best_params[1]}")
         print(f"Test Accuracy (After tuning): {acc_tuned:.2f}%")
+        out_metrics = {
+            "Test Accuracy (Before tuning)": acc,
+            "Test Accuracy (After tuning)": acc_tuned,
+            "Best alpha": best_params[0],
+            "Best timestep": best_params[1]
+        }
+        save_results(args.output_dir, out_metrics)
         return
 
     # Training
@@ -190,7 +202,7 @@ def main():
                     best_acc = acc
                     # Save best model logic can go here if needed.
             else:
-                acc = evaluate_multilabel(model, test_loader, dataset.multi_map, device, alpha=cfg['alpha'])
+                acc = evaluate_multilabel(model, test_loader, dataset.multi_map, device, alpha=cfg['alpha'], t_end=0.8, solver="dopri5")
                 print(f"Test Result: {acc}")
 
     # Save Config and OP automatically
@@ -206,10 +218,16 @@ def main():
 
         acc_tuned = evaluate(model, test_loader, device, alpha=best_params[0], t_end=best_params[1])
         print(f"Test Accuracy (After tuning): {acc_tuned:.2f}%")
+        out_metrics = {
+            "Test Accuracy (Before tuning)": acc,
+            "Test Accuracy (After tuning)": acc_tuned,
+            "Best alpha": best_params[0],
+            "Best timestep": best_params[1]
+        }
     else:
         multi_map = dataset.multi_map
-        acc = evaluate_multilabel(model, test_loader, multi_map, device, alpha=cfg['alpha'])
-        logger.info(f"Test Result (Before tuning): {acc}")
+        acc_m = evaluate_multilabel(model, test_loader, multi_map, device, alpha=cfg['alpha'])
+        logger.info(f"Test Result (Before tuning): {acc_m}")
 
         logger.info(f"Hyparparams tuning...")
         val_acc, best_params = model.tune_hyperparameters(val_loader, multi_map=dataset.multi_map, device=device)
@@ -217,7 +235,16 @@ def main():
 
         acc_tuned = evaluate_multilabel(model, test_loader, multi_map, device, alpha=best_params[0], t_end=best_params[1])
         logger.info(f"Test Result (After tuning): {acc_tuned}")
+        out_metrics = {
+            "Test AUC (Before tuning)": acc_m['macro_AUROC'],
+            "Test AUPRC (Before tuning)": acc_m['macro_AUPRC'],
+            "Test AUC (After tuning)": acc_tuned['macro_AUROC'],
+            "Test AUPRC (After tuning)": acc_tuned['macro_AUPRC'],
+            "Best alpha": best_params[0],
+            "Best timestep": best_params[1]
+        }
 
+    save_results(args.output_dir, out_metrics)
     return
 
 
