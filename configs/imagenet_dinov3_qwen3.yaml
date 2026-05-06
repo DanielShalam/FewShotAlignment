@@ -1,0 +1,33 @@
+dataset: "ImageNet"
+root: "/efs/user_folders/dnshalam/datasets"
+shots: 16
+seed: 42
+
+# Training
+epochs: 50
+lr: 0.00001
+wd: 0.00001
+batch_size: 32
+eval_freq: 10
+num_workers: 8
+grad_clip: 0.0
+
+# Model / Flow
+fm_type: "geodesic"
+inv_fm_type: "adapter"
+use_op: True
+pretrained_op: ""
+text_adapter: True
+ada_depth: 4
+ada_dim: 1536
+ada_t_dim: 256
+train_time_samples: 1
+alpha: 0.
+use_context: False
+use_final_layer_head: False
+
+# Encoders: DINOv3-B + Qwen3-0.6B
+img_src: "HF"
+img_model: "facebook/dinov3-vitb16-pretrain-lvd1689m"
+txt_src: "HF"
+txt_model: "Qwen/Qwen3-Embedding-0.6B"

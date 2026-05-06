@@ -9,7 +9,7 @@ from src.utils import setup_logger, set_seed, save_checkpoint, load_checkpoint
 
 from src.datasets.base_dataset import build_dataset, build_loaders, DatasetWrapper
 from src.model import FlowAdapter, MultiLabelFlowAdapter, GuidedVelocity
-from src.engine import train_one_epoch, evaluate, evaluate_multilabel
+from src.engine import train_one_epoch, evaluate, evaluate_multilabel, build_feature_cache, evaluate_cached
 
 def save_results(output_dir, metrics):
     with open(os.path.join(output_dir, "results.json"), "w") as f:
@@ -133,26 +133,26 @@ def main():
         multi_map = getattr(dataset, "multi_map", None)
         model.create_bank(train_val_loader, multi_map=multi_map)
 
+        # Build image-feature caches once to skip the encoder forward on all
+        # subsequent intermediate evals and the final hyperparameter-tuning
+        # sweep. Safe because the image encoder is frozen during training.
+        _cache_test_feats, _cache_test_labels = None, None
+        _cache_val_feats, _cache_val_labels = None, None
+        if cfg["dataset"] != "VinDrCXR":
+            logger.info("Building test feature cache (image encoder is frozen)...")
+            _cache_test_feats, _cache_test_labels = build_feature_cache(
+                model, test_loader, device, desc="Caching test feats")
+            if val_loader is not None:
+                logger.info("Building val feature cache...")
+                _cache_val_feats, _cache_val_labels = build_feature_cache(
+                    model, val_loader, device, desc="Caching val feats")
+            logger.info(
+                f"Caches built: test={tuple(_cache_test_feats.shape)}, "
+                f"val={tuple(_cache_val_feats.shape) if _cache_val_feats is not None else None}"
+            )
+
     # Eval Only Mode
     if args.eval_only:
-        base_model = copy.deepcopy(model.adapter.vecfield)
-        txt_feats = model.text_encoder.text_features.to(device)
-        txt_feats = torch.nn.functional.normalize(txt_feats @ model.OP.W.float().to(device), dim=-1)
-        for t_end in [0.05, 0.1, 0.25, 0.5, 1.]:
-            for guidance_scale in [0., 0.1, 0.25, 0.5, 1.0]:
-                model.adapter.vecfield = GuidedVelocity(
-                    base_model=base_model, 
-                    txt_feats=txt_feats,
-                    guidance_scale=guidance_scale, 
-                    logit_scale=1.,
-                )
-                acc = evaluate(model, test_loader, device, alpha=cfg['alpha'], t_end=t_end, steps=4)
-                print(f"Test Accuracy with t_end={t_end}, guidance_scale={guidance_scale}: {acc:.2f}%")
-        model.adapter.vecfield = GuidedVelocity(
-            base_model=base_model, 
-            txt_feats=txt_feats, 
-            guidance_scale=1., logit_scale=1.,
-            )
         acc = evaluate(model, test_loader, device, alpha=cfg['alpha'])
         print(f"Test Accuracy (Before tuning): {acc:.2f}%")
         val_acc, best_params = model.tune_hyperparameters(val_loader, device=device)
@@ -169,10 +169,36 @@ def main():
         return
 
     # Training
-    params = model.adapter.parameters() if not cfg["text_adapter"] \
-        else list(model.adapter.parameters()) + list(model.t_adapter.parameters())
-    optimizer = torch.optim.AdamW(params, lr=cfg['lr'], weight_decay=cfg['wd'])
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg['epochs'])
+    adapter_params = list(model.adapter.parameters())
+    if cfg["text_adapter"]:
+        adapter_params += list(model.t_adapter.parameters())
+    # If OP.W is trainable (cfg['op_trainable']=True), include it as a
+    # separate param group with a configurable lower LR (defaults to cfg['lr']
+    # if op_lr is unset).
+    if cfg.get("op_trainable", False) and isinstance(getattr(model.OP, "W", None), torch.nn.Parameter):
+        op_lr = float(cfg.get("op_lr", cfg['lr']))
+        param_groups = [
+            {"params": adapter_params, "lr": cfg['lr'], "weight_decay": cfg['wd']},
+            {"params": [model.OP.W], "lr": op_lr, "weight_decay": cfg['wd']},
+        ]
+        print(f"[optim] trainable OP.W (shape={tuple(model.OP.W.shape)}) with lr={op_lr}")
+        optimizer = torch.optim.AdamW(param_groups)
+    else:
+        optimizer = torch.optim.AdamW(adapter_params, lr=cfg['lr'], weight_decay=cfg['wd'])
+    # Optional linear warmup before cosine decay.
+    warmup_epochs = int(cfg.get("warmup_epochs", 0))
+    warmup_start_factor = float(cfg.get("warmup_start_factor", 1e-3))
+    if warmup_epochs > 0 and warmup_epochs < cfg['epochs']:
+        warm = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=warmup_start_factor, end_factor=1.0,
+            total_iters=warmup_epochs)
+        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=cfg['epochs'] - warmup_epochs)
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warm, cosine], milestones=[warmup_epochs])
+        logger.info(f"LR schedule: linear warmup {warmup_epochs} epochs (start_factor={warmup_start_factor}) -> cosine decay")
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg['epochs'])
     
     best_acc = 0.0
     eval_freq = cfg.get('eval_freq', cfg['epochs']) # Default to only evaluating at the end if not specified
@@ -196,7 +222,11 @@ def main():
         if epoch % eval_freq == 0:
             print(f"--- Fast Evaluation at Epoch {epoch} ---")
             if cfg['dataset'] != "VinDrCXR":
-                acc = evaluate(model, test_loader, device, alpha=cfg['alpha'])
+                if _cache_test_feats is not None:
+                    acc = evaluate_cached(model, _cache_test_feats, _cache_test_labels,
+                                          device, alpha=cfg['alpha'])
+                else:
+                    acc = evaluate(model, test_loader, device, alpha=cfg['alpha'])
                 print(f"Test Accuracy: {acc:.2f}%")
                 if acc > best_acc:
                     best_acc = acc
@@ -209,14 +239,25 @@ def main():
     save_checkpoint(model, optimizer, scheduler, cfg, epoch, args.output_dir, is_best=True)
 
     if cfg['dataset'] != "VinDrCXR":
-        acc = evaluate(model, test_loader, device, alpha=cfg['alpha'])
+        if _cache_test_feats is not None:
+            acc = evaluate_cached(model, _cache_test_feats, _cache_test_labels,
+                                  device, alpha=cfg['alpha'])
+        else:
+            acc = evaluate(model, test_loader, device, alpha=cfg['alpha'])
         print(f"Test Accuracy (Before tuning): {acc:.2f}%")
 
         print(f"Hyparparams tuning...")
-        val_acc, best_params = model.tune_hyperparameters(val_loader, device=device)
+        val_acc, best_params = model.tune_hyperparameters(
+            val_loader, device=device,
+            cached_feats=_cache_val_feats, cached_labels=_cache_val_labels,
+        )
         print(f"Best Hyparparams: alpha={best_params[0]}, timestep={best_params[1]}")
 
-        acc_tuned = evaluate(model, test_loader, device, alpha=best_params[0], t_end=best_params[1])
+        if _cache_test_feats is not None:
+            acc_tuned = evaluate_cached(model, _cache_test_feats, _cache_test_labels,
+                                        device, alpha=best_params[0], t_end=best_params[1])
+        else:
+            acc_tuned = evaluate(model, test_loader, device, alpha=best_params[0], t_end=best_params[1])
         print(f"Test Accuracy (After tuning): {acc_tuned:.2f}%")
         out_metrics = {
             "Test Accuracy (Before tuning)": acc,

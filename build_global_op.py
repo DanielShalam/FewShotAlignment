@@ -233,64 +233,6 @@ def extract_batch_features(
     return F.normalize(image_feat, dim=-1), F.normalize(text_feat, dim=-1)
 
 
-@torch.inference_mode()
-def accumulate_from_iterator(
-        iterator: Iterator[Dict[str, List]],
-        text_encoder,
-        image_encoder,
-        text_pre,
-        image_pre,
-        device: torch.device,
-        log_every: int = 50,
-):
-    # Fixed: Use passed encoder objects instead of global clip_enc/tgt_enc
-    D_t = text_encoder.text_dim
-    D_x = image_encoder.dim
-
-    M = torch.zeros(D_t, D_x, device=device)
-
-    num_pairs = 0
-
-    for bi, batch in enumerate(iterator):
-        if batch is None:
-            continue
-        imgs_pil: List[Image.Image] = batch["image"]
-        caps: List[str] = batch["caption"]
-        if len(imgs_pil) == 0:
-            continue
-
-        # text encoding
-        if isinstance(text_encoder, HFTextEncoder):
-            text_feat = text_encoder.encode_text(text_encoder.tokenize(caps))  # [B, D_t]
-        else:
-            text_feat = text_encoder.encode_text(caps)  # [B, D_t]
-
-        # image encodings
-        if isinstance(image_encoder, HFImageEncoder):
-            img_feat = image_encoder(imgs_pil)  # [B, D_x]
-        else:
-            # Fixed: Use image_pre instead of undefined tgt_pre
-            x_tensors = torch.stack([image_pre(img) for img in imgs_pil], 0).to(device)
-            if hasattr(image_encoder, "encode_image"):
-                img_feat = image_encoder.encode_image(x_tensors)  # [B, D_x]
-            else:
-                img_feat = image_encoder.get_feats(x_tensors)  # [B, D_x]
-
-        # Fixed: dim=-1 (was dim-1)
-        text_feat = F.normalize(text_feat, dim=-1)
-        img_feat = F.normalize(img_feat, dim=-1)
-
-        M += text_feat.t() @ img_feat
-        # Fixed: Use actual batch size instead of undefined 'x'
-        num_pairs += text_feat.size(0)
-
-    # Removed referencing undefined 'weight_mode', 'weight_tau', 'mean_w_accum'
-    stats = {
-        "num_pairs": num_pairs,
-    }
-    return M, stats
-
-
 def evaluate_proj_text(test_data, proj):
     img_features = test_data["image"]
     txt_features = test_data["text"] @ proj.float().to(test_data["image"].device)
@@ -304,9 +246,19 @@ def rectangular_op_from_cov(M: torch.Tensor) -> torch.Tensor:
     """
     Solve min ||T W - X||_F with W having orthonormal columns when possible.
     For rectangular case, W = U V^T with SVD(M) = U Σ V^T.
+
+    Sign fix: only applied when M is square (then W is square). For rectangular
+    W the notion of determinant is undefined and we leave the SVD solution as-is.
+    This mirrors the convention used in src/model.py's orthogonal_procrustes().
     """
+    Dt, Di = M.shape
     U, S, Vh = torch.linalg.svd(M, full_matrices=False)  # U: [D_t, r], Vh: [r, D_x]
     W = U @ Vh  # [D_t, D_x]
+    # Sign fix only for square case (Dt == Di), matching model.py.
+    if Dt == Di:
+        if torch.det(W) < 0:
+            U[:, -1] = -U[:, -1]
+            W = U @ Vh
     return W
 
 
@@ -331,6 +283,12 @@ def main():
     p.add_argument("--max_samples", type=int, default=None, help="Optional cap on dataset size")
     p.add_argument("--max_batches", type=int, default=None, help="Optional cap on num batches")
     p.add_argument("--val_batches", type=int, default=0, help="Optional validation batches")
+    p.add_argument("--val_wds_pattern", type=str, default=None,
+                   help="Optional separate glob for held-out validation shards. "
+                        "If set, --val_batches is drawn from this pattern instead of the tail of --wds_pattern.")
+    p.add_argument("--save_pairs", type=str, default=None,
+                   help="Optional .pth path. If set, dumps the (img_feats, txt_feats) pairs used to fit M, "
+                        "rather than accumulating only into M. Useful as a 'pair pool' for downstream OP fits.")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
@@ -428,43 +386,107 @@ def main():
         print("Provide either --wds-pattern (recommended) or --tsv.", file=sys.stderr)
         sys.exit(1)
 
-    # Accumulate cross-covariance
+    # Accumulate cross-covariance.
+    #
+    # Two modes for validation:
+    #   1. --val_wds_pattern: separate iterator over held-out shards.
+    #      --val_batches controls how many to pull from it.
+    #   2. No val_wds_pattern: trailing --val_batches of the main iterator are
+    #      diverted to validation (in-stream split).
     val_data = {"image": [], "text": []}
+    pair_pool_img = []
+    pair_pool_txt = []
     M = torch.zeros(txt_dim, img_dim, device=device)
-
     seen = 0
+    n_val = max(0, int(args.val_batches))
+    max_total = args.max_batches
+    use_external_val = (args.val_wds_pattern is not None) and (n_val > 0)
+    accum_cap = (max_total - n_val) if (max_total is not None and not use_external_val) else max_total
+
     for bi, batch in enumerate(tqdm(it, desc="Accumulating M...")):
-        if args.max_batches is not None and bi >= args.max_batches > 0:
-            if bi - args.max_batches < args.val_batches:
-                img_f, txt_f = extract_batch_features(
-                    batch, text_encoder, image_encoder, text_pre, image_pre, device
-                )
-                val_data["image"].extend(img_f.cpu())
-                val_data["text"].extend(txt_f.cpu())
-                continue
-            else:
-                break
+        if batch is None:
+            continue
+        # Stop when we've hit the cap (accum + optional in-stream val)
+        if max_total is not None and bi >= max_total:
+            break
 
-        # reuse the accumulator for a single batch at a time
-        Mi, stats = accumulate_from_iterator(
-            [batch], text_encoder, image_encoder, text_pre, image_pre, device, log_every=1
+        # In-stream validation: divert trailing batches
+        if not use_external_val and accum_cap is not None and bi >= accum_cap:
+            img_f, txt_f = extract_batch_features(
+                batch, text_encoder, image_encoder, text_pre, image_pre, device
+            )
+            if len(img_f) > 0:
+                val_data["image"].append(img_f.cpu())
+                val_data["text"].append(txt_f.cpu())
+            continue
+
+        # Accumulate into M
+        img_feat, text_feat = extract_batch_features(
+            batch, text_encoder, image_encoder, text_pre, image_pre, device
         )
-        M += Mi
-        seen += stats["num_pairs"]
-        if (bi + 1) % 20 == 0:
-            print(f"[progress] shards/batches processed: {bi + 1}, pairs={seen}")
+        if len(img_feat) == 0:
+            continue
+        M += text_feat.t() @ img_feat
+        seen += text_feat.size(0)
+        # (optional) also collect the raw pairs
+        if args.save_pairs is not None:
+            pair_pool_img.append(img_feat.cpu())
+            pair_pool_txt.append(text_feat.cpu())
 
-    print(f"Total pairs used: {seen}")
+        if (bi + 1) % 20 == 0:
+            print(f"[progress] batches processed: {bi + 1}, pairs={seen}")
+
+    print(f"Total pairs used for M: {seen}")
+
+    # External validation: pull n_val batches from the held-out pattern.
+    if use_external_val:
+        print(f"Collecting validation from {args.val_wds_pattern} ...")
+        val_it = make_wds_iterator(
+            args.val_wds_pattern, args.batch_size,
+            caption_kind=args.wds_caption_kind,
+            json_field=args.wds_json_field,
+            image_exts=args.image_exts,
+            num_workers=args.num_workers,
+        )
+        for bi, batch in enumerate(val_it):
+            if bi >= n_val:
+                break
+            if batch is None:
+                continue
+            img_f, txt_f = extract_batch_features(
+                batch, text_encoder, image_encoder, text_pre, image_pre, device
+            )
+            if len(img_f) > 0:
+                val_data["image"].append(img_f.cpu())
+                val_data["text"].append(txt_f.cpu())
+
+    if val_data["image"]:
+        print(f"Val batches collected: {len(val_data['image'])}")
 
     # Solve OP
     print("Solving rectangular OP ...")
     W = rectangular_op_from_cov(M)
 
-    if args.val_batches > 1 and len(val_data["image"]) > 0:
+    if len(val_data["image"]) > 0:
         torch.cuda.empty_cache()
-        print(f"Validation (batches={args.val_batches})...")
-        val_data = {k: torch.stack(v) for k, v in val_data.items()}
+        print(f"Validation (batches={len(val_data['image'])}, samples={sum(t.size(0) for t in val_data['image'])})...")
+        val_data = {k: torch.cat(v, dim=0) for k, v in val_data.items()}
         evaluate_proj_text(val_data, proj=W)
+
+    # Optionally dump the raw pairs
+    if args.save_pairs is not None and pair_pool_img:
+        pairs_img = torch.cat(pair_pool_img, dim=0)
+        pairs_txt = torch.cat(pair_pool_txt, dim=0)
+        pp = Path(args.save_pairs)
+        pp.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "img_feats": pairs_img.half(),  # fp16 to save space
+            "txt_feats": pairs_txt.half(),
+            "num_pairs": int(pairs_img.size(0)),
+            "image_model": args.image_model,
+            "text_model": args.text_model,
+        }, pp)
+        print(f"[✓] Saved {pairs_img.size(0)} pairs to {pp}")
 
     # Save
     out = Path(args.out)

@@ -44,9 +44,17 @@ def setup_logger(output_dir):
 
 
 def save_checkpoint(model, optimizer, scheduler, config, epoch, output_dir, is_best=False):
-    # This explicitly saves the OP matrix (self.OP.W) because it is part of the model state_dict
+    # Filter out frozen image/text encoder weights: they come from HF and are
+    # re-instantiated on load. This keeps checkpoints small (MBs instead of GBs).
+    full_sd = model.state_dict()
+    _frozen_prefixes = ('image_encoder.', 'text_encoder.')
+    lean_sd = {k: v for k, v in full_sd.items() if not k.startswith(_frozen_prefixes)}
+
+    # Keep optimizer state only for params that correspond to trainable (non-frozen)
+    # components. Optimizer state_dict is already just for params passed to the
+    # optimizer (adapter + t_adapter), so it is small.
     state = {
-        'state_dict': model.state_dict(),
+        'state_dict': lean_sd,
         'optimizer': optimizer.state_dict(),
         'scheduler': scheduler.state_dict() if scheduler else None,
         'epoch': epoch,

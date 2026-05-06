@@ -28,8 +28,14 @@ class SUN397(DatasetBase):
             with open(os.path.join(self.dataset_dir, "ClassName.txt"), "r") as f:
                 lines = f.readlines()
                 for line in lines:
-                    line = line.strip()[1:].split("/")[-1].split(" ")[0]  # remove /
-                    classnames.append(line)
+                    # Build hyphenated key from nested class path, so keys match
+                    # the '-'.join form used in read_data (e.g. apartment_building-outdoor).
+                    parts = line.strip()[1:].split(" ")[0]  # strip leading / and take path
+                    # parts looks like 'a/apartment_building/outdoor' -> trim top single-char prefix
+                    segs = parts.split("/")
+                    if len(segs[0]) == 1:
+                        segs = segs[1:]
+                    classnames.append("-".join(segs))
             cname2lab = {c: i for i, c in enumerate(classnames)}
             print(cname2lab)
             trainval = self.read_data(cname2lab, "Training_01.txt", split_type="train")

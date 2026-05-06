@@ -46,7 +46,7 @@ class EuroSAT(DatasetBase):
             seed = cfg["seed"]
             preprocessed = os.path.join(self.split_fewshot_dir, f"shot_{num_shots}-seed_{seed}.pkl")
             
-            if False and os.path.exists(preprocessed):
+            if os.path.exists(preprocessed):
                 print(f"Loading preprocessed few-shot data from {preprocessed}")
                 with open(preprocessed, "rb") as file:
                     data = pickle.load(file)

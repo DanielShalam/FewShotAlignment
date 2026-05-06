@@ -29,3 +29,18 @@ env/
 # IDE metadata
 .idea/
 .vscode/
+
+# Large data directories (datasets checked into repo during prototyping)
+data/
+
+# Misc temporary / exploratory scripts we don't want in the repo
+diagnose_flow.py
+eval_proto.py
+eval_zs_op_swap.py
+sweep_invfmtype.py
+sweep_solvers.py
+sweep_t_img_t_txt.py
+prep_fewshot.py
+run_lfa.py
+summarize_fewshot.py
+src/lfa.py

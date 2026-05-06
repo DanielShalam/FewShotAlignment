@@ -39,19 +39,48 @@ def _resolve_sizes(proc) -> Tuple[int, int]:
 
     return int(resize_short), int(crop)
 
-def make_transforms_hf(model_name: str, rrc_scale: Tuple[float,float]=(0.5, 1.0), hflip_p: float=0.5):
+def make_transforms_hf(model_name: str, rrc_scale: Tuple[float,float]=(0.5, 1.0),
+                       hflip_p: float=0.5, aug_level: str="mild",
+                       color_jitter: float=0.0, randaug_n: int=0, randaug_m: int=9,
+                       random_erase_p: float=0.0):
+    """Build image-encoder transforms.
+
+    aug_level: "mild" (default, original minimal pipeline), "strong"
+        (color jitter + RandAugment + optional random erasing). Individual
+        knobs can be overridden regardless of aug_level.
+    color_jitter: brightness/contrast/saturation jitter amount (0 = off).
+    randaug_n: number of RandAugment ops per image (0 = off).
+    randaug_m: RandAugment magnitude 0-30.
+    random_erase_p: probability of random-erase patch (0 = off).
+    """
     proc = AutoProcessor.from_pretrained(model_name)
     resize_short, crop = _resolve_sizes(proc)
     mean = getattr(proc, "image_mean", (0.485, 0.456, 0.406))
     std  = getattr(proc, "image_std",  (0.229, 0.224, 0.225))
 
-    # Mild augmentation, but preserve HF normalization + geometry
-    train_tfm = T.Compose([
+    # Apply "strong" preset if requested and no manual knob was set.
+    if aug_level == "strong":
+        if color_jitter == 0.0: color_jitter = 0.4
+        if randaug_n == 0:      randaug_n = 2
+        if random_erase_p == 0.0: random_erase_p = 0.25
+
+    aug_ops = [
         T.RandomResizedCrop(size=224, scale=rrc_scale, interpolation=T.InterpolationMode.BICUBIC),
         T.RandomHorizontalFlip(p=hflip_p),
-        T.ToTensor(),
-        T.Normalize(mean=mean, std=std),
-    ])
+    ]
+    if color_jitter > 0.0:
+        aug_ops.append(T.ColorJitter(brightness=color_jitter,
+                                     contrast=color_jitter,
+                                     saturation=color_jitter))
+    if randaug_n > 0:
+        aug_ops.append(T.RandAugment(num_ops=randaug_n, magnitude=randaug_m,
+                                     interpolation=T.InterpolationMode.BICUBIC))
+    aug_ops.append(T.ToTensor())
+    aug_ops.append(T.Normalize(mean=mean, std=std))
+    if random_erase_p > 0.0:
+        aug_ops.append(T.RandomErasing(p=random_erase_p))
+
+    train_tfm = T.Compose(aug_ops)
     eval_tfm = T.Compose([
         T.Resize(resize_short, interpolation=InterpolationMode.BICUBIC, antialias=True),
         T.CenterCrop(crop),
@@ -69,13 +98,13 @@ class HFTextEncoder(nn.Module):
     and extract features for different modalities.
     """
 
-    def __init__(self, txt_model: str, device: torch.device = torch.device("cpu")):
+    def __init__(self, txt_model: str, device: torch.device = torch.device("cuda")):
         super().__init__()
         self.device = device
         self.txt_model_name = txt_model
         try:
-            self.txt_model = AutoModel.from_pretrained(txt_model)
-            self.tokenizer = AutoTokenizer.from_pretrained(txt_model)
+            self.txt_model = AutoModel.from_pretrained(txt_model, trust_remote_code=True)
+            self.tokenizer = AutoTokenizer.from_pretrained(txt_model, trust_remote_code=True)
         except:
             from sentence_transformers import SentenceTransformer
             self.txt_model = SentenceTransformer(txt_model)
@@ -194,5 +223,5 @@ class HFImageEncoder(nn.Module):
             #     attn = F.softmax(attn, dim=-1)                        # [B, N]
             #     image_features = torch.einsum('bn,bnd->bd', attn, patch_tokens)  # [B, D]
 
-        return F.normalize(image_features, dim=1) if normalize else image_features
+        return F.normalize(image_features, dim=-1) if normalize else image_features
 
