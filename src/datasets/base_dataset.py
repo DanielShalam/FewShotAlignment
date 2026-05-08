@@ -15,6 +15,9 @@ from src.utils import Registry
 
 DATASET_REGISTRY = Registry("DATASET")
 
+# Registry for precomputed-feature datasets: impath -> tensor
+FEATURE_REGISTRY: dict = {}
+
 
 def build_dataset(cfg):
     avai_datasets = DATASET_REGISTRY.registered_names()

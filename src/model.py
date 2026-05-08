@@ -55,6 +55,17 @@ CUSTOM_TEMPLATES = {
     'ImageNetR': 'a photo of a {}.',
     'ChestX14': 'a chest X-ray showing {}.',
     'VinDrCXR': 'a chest X-ray showing {}.',
+    'BUSI': 'a biomedical image of {}.',
+    'KneeXray': 'a biomedical image of {}.',
+    'CHMNIST': 'a biomedical image of {}.',
+    'BTMRI': 'a biomedical image of {}.',
+    'COVID_19': 'a biomedical image of {}.',
+    'CTKidney': 'a biomedical image of {}.',
+    'DermaMNIST': 'a biomedical image of {}.',
+    'Kvasir': 'a biomedical image of {}.',
+    'LungColon': 'a biomedical image of {}.',
+    'OCTMNIST': 'a biomedical image of {}.',
+    'RETINA': 'a biomedical image of {}.',
 }
 
 ## Helpers

@@ -28,7 +28,7 @@ from src.datasets.base_dataset import build_dataset, DatasetWrapper
 
 
 # Same prompt ensemble as FSA's TextEncoder uses (prompt_ensembling n=7).
-PROMPTS = [
+PROMPTS_IMAGENET = [
     "itap of a {}.",
     "a bad photo of the {}.",
     "a origami {}.",
@@ -38,13 +38,29 @@ PROMPTS = [
     "a photo of the small {}.",
 ]
 
+PROMPTS_BIOMED = [
+    "a medical image of {}.",
+    "a histopathology image of {}.",
+    "a radiology image showing {}.",
+    "a clinical photograph of {}.",
+    "{}",
+]
+
+PROMPTS_SIMPLE = ["{}"]
+
+PROMPT_STYLES = {
+    "imagenet": PROMPTS_IMAGENET,
+    "biomed": PROMPTS_BIOMED,
+    "simple": PROMPTS_SIMPLE,
+}
+
 
 @torch.no_grad()
-def encode_text_ensemble(model, tokenizer, classnames, device):
-    """Return [C, D] normalized text features averaged over PROMPTS."""
+def encode_text_ensemble(model, tokenizer, classnames, device, prompt_templates):
+    """Return [C, D] normalized text features averaged over prompt_templates."""
     feats = []
     for cn in classnames:
-        prompts = [p.format(cn) for p in PROMPTS]
+        prompts = [p.format(cn) for p in prompt_templates]
         tokens = tokenizer(prompts).to(device)
         f = model.encode_text(tokens)
         f = F.normalize(f.float(), dim=-1)
@@ -78,6 +94,8 @@ def main():
     p.add_argument("--config", default="configs/imagenet_dinov3_qwen3.yaml")
     p.add_argument("--root", default="/efs/user_folders/dnshalam/datasets")
     p.add_argument("--out", required=True)
+    p.add_argument("--prompt_style", default="imagenet",
+                   choices=["imagenet", "biomed", "simple"])
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--num_workers", type=int, default=8)
     args = p.parse_args()
@@ -111,7 +129,9 @@ def main():
 
     # Encode text
     print("[*] Encoding text prompts...")
-    text_feats = encode_text_ensemble(model, tokenizer, classnames, device)
+    prompt_templates = PROMPT_STYLES[args.prompt_style]
+    print(f"[*] Using {len(prompt_templates)} prompt templates ({args.prompt_style})")
+    text_feats = encode_text_ensemble(model, tokenizer, classnames, device, prompt_templates)
     print(f"[+] text feats shape: {text_feats.shape}")
 
     # Encode images + compute logits
